@@ -48,6 +48,7 @@ obj-$(CONFIG_PERF_EVENTS_INTEL_UNCORE)	+= perf_event_intel_uncore.o \
 					   perf_event_intel_uncore_nhmex.o
 endif
 
+obj-$(CONFIG_INTEL_RDT) 		+= intel_rdt.o
 
 obj-$(CONFIG_X86_MCE)			+= mcheck/
 obj-$(CONFIG_MTRR)			+= mtrr/
