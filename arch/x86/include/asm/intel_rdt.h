@@ -4,6 +4,9 @@
 #ifdef CONFIG_CGROUP_RDT
 
 #include <linux/cgroup.h>
+#define MAX_CBM_LENGTH			32
+#define IA32_L3_CBM_BASE		0xc90
+#define CBM_FROM_INDEX(x)		(IA32_L3_CBM_BASE + x)
 
 struct rdt_subsys_info {
 	/* Clos Bitmap to keep track of available CLOSids.*/
