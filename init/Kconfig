@@ -983,6 +983,17 @@ config CPUSETS
 
 	  Say N if unsure.
 
+config CGROUP_RDT
+	bool "Resource Director Technology cgroup subsystem"
+	depends on X86_64 && CPU_SUP_INTEL
+	help
+	  This option provides a cgroup to allocate Platform shared
+	  resources. Among the shared resources, current implementation
+	  focuses on L3 Cache. Using the interface user can specify the
+	  amount of L3 cache space into which an application can fill.
+
+	  Say N if unsure.
+
 config PROC_PID_CPUSET
 	bool "Include legacy /proc/<pid>/cpuset file"
 	depends on CPUSETS
