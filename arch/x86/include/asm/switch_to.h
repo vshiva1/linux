@@ -8,6 +8,9 @@ struct tss_struct;
 void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p,
 		      struct tss_struct *tss);
 
+#include <asm/intel_rdt.h>
+#define finish_arch_switch(prev)	intel_rdt_sched_in()
+
 #ifdef CONFIG_X86_32
 
 #ifdef CONFIG_CC_STACKPROTECTOR

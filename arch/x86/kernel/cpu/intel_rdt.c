@@ -35,6 +35,8 @@ static struct clos_cbm_map *ccmap;
 static struct rdt_subsys_info rdtss_info;
 static DEFINE_MUTEX(rdt_group_mutex);
 struct intel_rdt rdt_root_group;
+struct static_key __read_mostly rdt_enable_key = STATIC_KEY_INIT_FALSE;
+DEFINE_PER_CPU(unsigned int, x86_cpu_clos);
 
 /*
  * Mask of CPUs for writing CBM values. We only need one per-socket.
@@ -77,6 +79,33 @@ static void intel_rdt_free_closid(unsigned int clos)
 	lockdep_assert_held(&rdt_group_mutex);
 
 	clear_bit(clos, rdtss_info.closmap);
+}
+
+void __rdt_sched_in(void)
+{
+	struct task_struct *task = current;
+	struct intel_rdt *ir;
+	unsigned int clos;
+
+	/*
+	 * This needs to be fixed
+	 * to cache the whole PQR instead of just CLOSid.
+	 * PQR has closid in high 32 bits and CQM-RMID in low 10 bits.
+	 * Should not write a 0 to the low 10 bits of PQR
+	 * and corrupt RMID.
+	 */
+	clos = this_cpu_read(x86_cpu_clos);
+
+	rcu_read_lock();
+	ir = task_rdt(task);
+	if (ir->clos == clos) {
+		rcu_read_unlock();
+		return;
+	}
+
+	wrmsr(MSR_IA32_PQR_ASSOC, 0, ir->clos);
+	this_cpu_write(x86_cpu_clos, ir->clos);
+	rcu_read_unlock();
 }
 
 static void __clos_get(unsigned int closid)
@@ -433,6 +462,7 @@ static int __init intel_rdt_late_init(void)
 	__hotcpu_notifier(intel_rdt_cpu_notifier, 0);
 
 	cpu_notifier_register_done();
+	static_key_slow_inc(&rdt_enable_key);
 
 	pr_info("Max bitmask length:%u,Max ClosIds: %u\n", max_cbm_len, maxid);
 out_err:

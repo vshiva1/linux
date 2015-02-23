@@ -4,9 +4,15 @@
 #ifdef CONFIG_CGROUP_RDT
 
 #include <linux/cgroup.h>
+
+#define MSR_IA32_PQR_ASSOC		0xc8f
 #define MAX_CBM_LENGTH			32
 #define IA32_L3_CBM_BASE		0xc90
 #define CBM_FROM_INDEX(x)		(IA32_L3_CBM_BASE + x)
+DECLARE_PER_CPU(unsigned int, x86_cpu_clos);
+extern struct static_key rdt_enable_key;
+extern void __rdt_sched_in(void);
+
 
 struct rdt_subsys_info {
 	/* Clos Bitmap to keep track of available CLOSids.*/
@@ -24,6 +30,11 @@ struct clos_cbm_map {
 	unsigned int clos_refcnt;
 };
 
+static inline bool rdt_enabled(void)
+{
+	return static_key_false(&rdt_enable_key);
+}
+
 /*
  * Return rdt group corresponding to this container.
  */
@@ -36,6 +47,39 @@ static inline struct intel_rdt *parent_rdt(struct intel_rdt *ir)
 {
 	return css_rdt(ir->css.parent);
 }
+
+/*
+ * Return rdt group to which this task belongs.
+ */
+static inline struct intel_rdt *task_rdt(struct task_struct *task)
+{
+	return css_rdt(task_css(task, intel_rdt_cgrp_id));
+}
+
+/*
+ * intel_rdt_sched_in() - Writes the task's CLOSid to IA32_PQR_MSR
+ *
+ * Following considerations are made so that this has minimal impact
+ * on scheduler hot path:
+ * - This will stay as no-op unless we are running on an Intel SKU
+ * which supports L3 cache allocation.
+ * - When support is present and enabled, does not do any
+ * IA32_PQR_MSR writes until the user starts really using the feature
+ * ie creates a rdt cgroup directory and assigns a cache_mask thats
+ * different from the root cgroup's cache_mask.
+ * - Closids are allocated so that different cgroup directories
+ * with same cache_mask gets the same CLOSid. This minimizes CLOSids
+ * used and reduces MSR write frequency.
+ */
+static inline void intel_rdt_sched_in(void)
+{
+	if (rdt_enabled())
+		__rdt_sched_in();
+}
+
+#else
+
+static inline void intel_rdt_sched_in(struct task_struct *task) {}
 
 #endif
 #endif
