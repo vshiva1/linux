@@ -4,15 +4,15 @@
 #ifdef CONFIG_CGROUP_RDT
 
 #include <linux/cgroup.h>
+#include <asm/rdt_common.h>
 
-#define MSR_IA32_PQR_ASSOC		0xc8f
 #define MAX_CBM_LENGTH			32
 #define IA32_L3_CBM_BASE		0xc90
 #define CBM_FROM_INDEX(x)		(IA32_L3_CBM_BASE + x)
-DECLARE_PER_CPU(unsigned int, x86_cpu_clos);
+
+DECLARE_PER_CPU(struct intel_pqr_state, pqr_state);
 extern struct static_key rdt_enable_key;
 extern void __rdt_sched_in(void);
-
 
 struct rdt_subsys_info {
 	/* Clos Bitmap to keep track of available CLOSids.*/
@@ -67,6 +67,9 @@ static inline struct intel_rdt *task_rdt(struct task_struct *task)
  * IA32_PQR_MSR writes until the user starts really using the feature
  * ie creates a rdt cgroup directory and assigns a cache_mask thats
  * different from the root cgroup's cache_mask.
+ * - Caches the per cpu CLOSid values and does the MSR write only
+ * when a task with a different CLOSid is scheduled in. That
+ * means the task belongs to a different cgroup.
  * - Closids are allocated so that different cgroup directories
  * with same cache_mask gets the same CLOSid. This minimizes CLOSids
  * used and reduces MSR write frequency.

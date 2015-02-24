@@ -85,27 +85,28 @@ void __rdt_sched_in(void)
 {
 	struct task_struct *task = current;
 	struct intel_rdt *ir;
-	unsigned int clos;
+	struct intel_pqr_state *state = this_cpu_ptr(&pqr_state);
+	unsigned long flags;
 
-	/*
-	 * This needs to be fixed
-	 * to cache the whole PQR instead of just CLOSid.
-	 * PQR has closid in high 32 bits and CQM-RMID in low 10 bits.
-	 * Should not write a 0 to the low 10 bits of PQR
-	 * and corrupt RMID.
-	 */
-	clos = this_cpu_read(x86_cpu_clos);
-
+	raw_spin_lock_irqsave(&state->lock, flags);
 	rcu_read_lock();
 	ir = task_rdt(task);
-	if (ir->clos == clos) {
+	if (ir->clos == state->clos) {
 		rcu_read_unlock();
+		raw_spin_unlock_irqrestore(&state->lock, flags);
 		return;
 	}
 
-	wrmsr(MSR_IA32_PQR_ASSOC, 0, ir->clos);
-	this_cpu_write(x86_cpu_clos, ir->clos);
+	/*
+	 * PQR has closid in high 32 bits and CQM-RMID
+	 * in low 10 bits. Rewrite the exsting rmid from
+	 * software cache.
+	 */
+	wrmsr(MSR_IA32_PQR_ASSOC, state->rmid, ir->clos);
+	state->clos = ir->clos;
 	rcu_read_unlock();
+	raw_spin_unlock_irqrestore(&state->lock, flags);
+
 }
 
 static void __clos_get(unsigned int closid)
@@ -372,6 +373,9 @@ static inline bool intel_rdt_update_cpumask(int cpu)
  */
 static inline void intel_rdt_cpu_start(int cpu)
 {
+	struct intel_pqr_state *state = &per_cpu(pqr_state, cpu);
+
+	state->clos = 0;
 	mutex_lock(&rdt_group_mutex);
 	if (intel_rdt_update_cpumask(cpu))
 		cbm_update_msrs(cpu);
