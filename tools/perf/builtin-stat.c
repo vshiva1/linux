@@ -315,6 +315,9 @@ static int create_perf_stat_counter(struct perf_evsel *evsel)
 			attr->enable_on_exec = 1;
 	}
 
+	if (target__has_pid(&target) && aggr_mode == AGGR_PROCESS)
+		evsel->attr.pid_stat = true;
+
 	return perf_evsel__open_per_thread(evsel, evsel_list->threads);
 }
 

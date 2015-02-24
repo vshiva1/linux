@@ -238,7 +238,9 @@ fail:
  * If @a and @b measure the same set of tasks then we want to share a
  * single RMID.
  */
-static bool __match_event(struct perf_event *a, struct perf_event *b)
+static bool __match_event(struct perf_event *a,
+			  struct perf_event *b,
+			  bool pid_stat)
 {
 	/* Per-cpu and task events don't mix */
 	if ((a->attach_state & PERF_ATTACH_TASK) !=
@@ -258,6 +260,9 @@ static bool __match_event(struct perf_event *a, struct perf_event *b)
 	 * Events that target same task are placed into the same cache group.
 	 */
 	if (a->hw.target == b->hw.target)
+		return true;
+
+	if (pid_stat && (a->hw.target->tgid == b->hw.target->tgid))
 		return true;
 
 	/*
@@ -828,7 +833,7 @@ static void intel_cqm_setup_event(struct perf_event *event,
 	list_for_each_entry(iter, &cache_groups, hw.cqm_groups_entry) {
 		rmid = iter->hw.cqm_rmid;
 
-		if (__match_event(iter, event)) {
+		if (__match_event(iter, event, event->attr.pid_stat)) {
 			/* All tasks in a group share an RMID */
 			event->hw.cqm_rmid = rmid;
 			*group = iter;
@@ -949,6 +954,14 @@ static u64 intel_cqm_event_count(struct perf_event *event)
 	if (event->hw.cqm_rmid == rr.rmid)
 		local64_set(&event->count, atomic64_read(&rr.value));
 	raw_spin_unlock_irqrestore(&cache_lock, flags);
+
+	if(event->attr.pid_stat == true)
+	{
+
+	pr_info("cqm: TID:%d,tgid: %d, RMID:%d,count : %llu\n",event->hw.target->pid, task_tgid_vnr(event->hw.target), rr.rmid, *((unsigned long long *)(&event->count)));  
+
+	}
+
 out:
 	return __perf_event_count(event);
 }
@@ -1089,6 +1102,9 @@ static int intel_cqm_event_init(struct perf_event *event)
 	event->destroy = intel_cqm_event_destroy;
 
 	mutex_lock(&cache_mutex);
+
+	if(event->attr.pid_stat == true)
+		pr_info("cqm : counting thread %d for pid option\n",event->hw.target->pid);  
 
 	/* Will also set rmid */
 	intel_cqm_setup_event(event, &group);
