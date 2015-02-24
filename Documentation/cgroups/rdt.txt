@@ -1,0 +1,206 @@
+        RDT
+        ---
+
+Copyright (C) 2014 Intel Corporation
+Written by vikas.shivappa@linux.intel.com
+(based on contents and format from cpusets.txt)
+
+CONTENTS:
+=========
+
+1. Cache Allocation Technology
+  1.1 What is RDT and Cache allocation ?
+  1.2 Why is Cache allocation needed ?
+  1.3 Cache allocation implementation overview
+  1.4 Assignment of CBM and CLOS
+  1.5 Scheduling and Context Switch
+2. Usage Examples and Syntax
+
+1. Cache Allocation Technology(Cache allocation)
+===================================
+
+1.1 What is RDT and Cache allocation
+-----------------------
+
+Cache allocation is a part of Resource Director Technology(RDT) or 
+Platform Shared resource control which provides support to control 
+Platform shared resources like L3 cache. Currently Cache is the only 
+resource that is supported in RDT.
+More information can be found in the Intel SDM, Volume 3, section 17.15.
+
+Cache Allocation Technology provides a way for the Software (OS/VMM)
+to restrict cache allocation to a defined 'subset' of cache which may
+be overlapping with other 'subsets'.  This feature is used when
+allocating a line in cache ie when pulling new data into the cache.
+The programming of the h/w is done via programming  MSRs.
+
+The different cache subsets are identified by CLOS identifier (class
+of service) and each CLOS has a CBM (cache bit mask).  The CBM is a
+contiguous set of bits which defines the amount of cache resource that
+is available for each 'subset'.
+
+1.2 Why is Cache allocation needed
+----------------------------------
+
+In todays new processors the number of cores is continuously increasing,
+especially in large scale usage models where VMs are used like
+webservers and datacenters. The number of cores increase the number
+of threads or workloads that can simultaneously be run. When
+multi-threaded-applications, VMs, workloads run concurrently they
+compete for shared resources including L3 cache.
+
+The Cache allocation  enables more cache resources to be made available
+for higher priority applications based on guidance from the execution
+environment.
+
+The architecture also allows dynamically changing these subsets during
+runtime to further optimize the performance of the higher priority
+application with minimal degradation to the low priority app.
+Additionally, resources can be rebalanced for system throughput
+benefit.  (Refer to Section 17.15 in the Intel SDM)
+
+This technique may be useful in managing large computer systems which
+large L3 cache. Examples may be large servers running  instances of
+webservers or database servers. In such complex systems, these subsets
+can be used for more careful placing of the available cache
+resources.
+
+1.3 Cache allocation implementation Overview
+--------------------------------------------
+
+Kernel implements a cgroup subsystem to support cache allocation.
+
+Each cgroup has a CLOSid <-> CBM(cache bit mask) mapping.
+A CLOS(Class of service) is represented by a CLOSid.CLOSid is internal
+to the kernel and not exposed to user.  Each cgroup would have one CBM
+and would just represent one cache 'subset'.
+
+The cgroup follows cgroup hierarchy ,mkdir and adding tasks to the
+cgroup never fails.  When a child cgroup is created it inherits the
+CLOSid and the CBM from its parent.  When a user changes the default
+CBM for a cgroup, a new CLOSid may be allocated if the CBM was not
+used before.  The changing of 'cache_mask' may fail with -ENOSPC once
+the kernel runs out of maximum CLOSids it can support.
+User can create as many cgroups as he wants but having different CBMs
+at the same time is restricted by the maximum number of CLOSids
+(multiple cgroups can have the same CBM).
+Kernel maintains a CLOSid<->cbm mapping which keeps reference counter
+for each cgroup using a CLOSid.
+
+The tasks in the cgroup would get to fill the L3 cache represented by
+the cgroup's 'cache_mask' file.
+
+Root directory would have all available  bits set in 'cache_mask' file
+by default.
+
+1.4 Assignment of CBM,CLOS
+--------------------------
+
+The 'cache_mask' needs to be a  subset of the parent node's
+'cache_mask'. Any contiguous subset of these bits(with a minimum of 2
+bits on hsw SKUs) maybe set to indicate the cache mapping desired. The
+'cache_mask' between 2 directories can overlap. The 'cache_mask' would
+represent the cache 'subset' of the Cache allocation cgroup. For ex: on
+a system with 16 bits of max cbm bits, if the directory has the least
+significant 4 bits set in its 'cache_mask' file(meaning the 'cache_mask'
+is just 0xf), it would be allocated the right quarter of the Last level
+cache which means the tasks belonging to this Cache allocation cgroup
+can use the right quarter of the cache to fill. If it
+has the most significant 8 bits set ,it would be allocated the left
+half of the cache(8 bits  out of 16 represents 50%).
+
+The cache portion defined in the CBM file is available to all tasks
+within the cgroup to fill and these task are not allowed to allocate
+space in other parts of the cache.
+
+1.5 Scheduling and Context Switch
+---------------------------------
+
+During context switch kernel implements this by writing the
+CLOSid (internally maintained by kernel) of the cgroup to which the
+task belongs to the CPU's IA32_PQR_ASSOC MSR. The MSR is only written
+when there is a change in the CLOSid for the CPU in order to minimize
+the latency incurred during context switch.
+
+The following considerations are done for the PQR MSR write so that it 
+has minimal impact on scheduling hot path:
+- This path doesnt exist on any non-intel platforms.
+- On Intel platforms, this would not exist by default unless CGROUP_RDT
+is enabled.
+- remains a no-op when CGROUP_RDT is enabled and intel hardware does not
+support the feature.
+- When feature is available, still remains a no-op till the user
+manually creates a cgroup *and* assigns a new cache mask. Since the
+child node inherits the parents cache mask , by cgroup creation there is
+no scheduling hot path impact from the new cgroup.
+- per cpu PQR values are cached and the MSR write is only done when
+there is a task with different PQR is scheduled on the CPU. Typically if
+the task groups are bound to be scheduled on a set of CPUs , the number
+of MSR writes is greatly reduced.
+
+2. Usage examples and syntax
+============================
+
+To check if Cache allocation was enabled on your system
+
+dmesg | grep -i intel_rdt
+should output : intel_rdt: Max bitmask length: xx,Max ClosIds: xx
+the length of cache_mask and CLOS should depend on the system you use.
+
+Following would mount the cache allocation cgroup subsystem and create
+2 directories. Please refer to Documentation/cgroups/cgroups.txt on
+details about how to use cgroups.
+
+  cd /sys/fs/cgroup
+  mkdir rdt
+  mount -t cgroup -ointel_rdt intel_rdt /sys/fs/cgroup/rdt
+  cd rdt
+
+Create 2 rdt cgroups
+
+  mkdir group1
+  mkdir group2
+
+Following are some of the Files in the directory
+
+  ls
+  rdt.cache_mask
+  tasks
+
+Say if the cache is 2MB and cbm supports 16 bits, then setting the
+below allocates the 'right 1/4th(512KB)' of the cache to group2
+
+Edit the CBM for group2 to set the least significant 4 bits.  This
+allocates 'right quarter' of the cache.
+
+  cd group2
+  /bin/echo 0xf > rdt.cache_mask
+
+
+Edit the CBM for group2 to set the least significant 8 bits.This
+allocates the right half of the cache to 'group2'.
+
+  cd group2
+  /bin/echo 0xff > rdt.cache_mask
+
+Assign tasks to the group2
+
+  /bin/echo PID1 > tasks
+  /bin/echo PID2 > tasks
+
+  Meaning now threads
+  PID1 and PID2 get to fill the 'right half' of
+  the cache as the belong to cgroup group2.
+
+Create a group under group2
+
+  cd group2
+  mkdir group21
+  cat rdt.cache_mask
+   0xff - inherits parents mask.
+
+  /bin/echo 0xfff > rdt.cache_mask - throws error as mask has to parent's mask's subset
+
+In order to restrict RDT cgroups to specific set of CPUs rdt can be comounted 
+with cpusets.
+
