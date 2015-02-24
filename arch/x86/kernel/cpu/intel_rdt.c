@@ -39,12 +39,68 @@ struct static_key __read_mostly rdt_enable_key = STATIC_KEY_INIT_FALSE;
 DEFINE_PER_CPU(unsigned int, x86_cpu_clos);
 
 /*
+ * Minimum bits required in Cache bitmask.
+ */
+static unsigned int min_bitmask_len = 1;
+
+/*
  * Mask of CPUs for writing CBM values. We only need one per-socket.
  */
 static cpumask_t rdt_cpumask;
 
 #define rdt_for_each_child(pos_css, parent_ir)		\
 	css_for_each_child((pos_css), &(parent_ir)->css)
+
+/*
+ * hsw_probetest() - Have to do probe
+ * test for Intel haswell CPUs as it does not have
+ * CPUID enumeration support for Cache allocation.
+ *
+ * Probes by writing to the high 32 bits(CLOSid)
+ * of the IA32_PQR_MSR and testing if the bits stick.
+ * Then hardcode the max CLOS and max bitmask length on hsw.
+ * The minimum cache bitmask length allowed for HSW is 2 bits.
+ */
+static inline bool hsw_probetest(void)
+{
+	u32 l, h_old, h_new, h_tmp;
+
+	if (rdmsr_safe(MSR_IA32_PQR_ASSOC, &l, &h_old))
+		return false;
+
+	/*
+	 * Default value is always 0 if feature is present.
+	 */
+	h_tmp = h_old ^ 0x1U;
+	if (wrmsr_safe(MSR_IA32_PQR_ASSOC, l, h_tmp) ||
+	    rdmsr_safe(MSR_IA32_PQR_ASSOC, &l, &h_new))
+		return false;
+
+	if (h_tmp != h_new)
+		return false;
+
+	wrmsr_safe(MSR_IA32_PQR_ASSOC, l, h_old);
+
+	boot_cpu_data.x86_rdt_max_closid = 4;
+	boot_cpu_data.x86_rdt_max_cbm_len = 20;
+	min_bitmask_len = 2;
+
+	return true;
+}
+
+static inline bool intel_cache_alloc_supported(struct cpuinfo_x86 *c)
+{
+	if (cpu_has(c, X86_FEATURE_CAT_L3))
+		return true;
+
+	/*
+	 * Probe test for Haswell CPUs.
+	 */
+	if (c->x86 == 0x6 && c->x86_model == 0x3f)
+		return hsw_probetest();
+
+	return false;
+}
 
 static void __clos_init(unsigned int closid)
 {
@@ -170,7 +226,7 @@ static inline bool cbm_is_contiguous(unsigned long var)
 	unsigned long maxcbm = MAX_CBM_LENGTH;
 	unsigned long first_bit, zero_bit;
 
-	if (!var)
+	if (bitmap_weight(&var, maxcbm) < min_bitmask_len)
 		return false;
 
 	first_bit = find_next_bit(&var, maxcbm, 0);
@@ -199,7 +255,8 @@ static int validate_cbm(struct intel_rdt *ir, unsigned long cbmvalue)
 	int err = 0;
 
 	if (!cbm_is_contiguous(cbmvalue)) {
-		pr_err("bitmask should have >= 1 bit and be contiguous\n");
+		pr_err("bitmask should have >=%d bits and be contiguous\n",
+			 min_bitmask_len);
 		err = -EINVAL;
 		goto out_err;
 	}
@@ -431,7 +488,7 @@ static int __init intel_rdt_late_init(void)
 	static struct clos_cbm_map *ccm;
 	size_t sizeb;
 
-	if (!cpu_has(c, X86_FEATURE_CAT_L3)) {
+	if (!intel_cache_alloc_supported(c)) {
 		rdt_root_group.css.ss->disabled = 1;
 		return -ENODEV;
 	}
