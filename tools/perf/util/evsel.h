@@ -26,6 +26,11 @@ struct perf_counts {
 	struct perf_counts_values cpu[];
 };
 
+struct aggr_counts {
+	int 	nr;
+	struct perf_counts_values proc[];
+};
+
 struct perf_evsel;
 
 /*
@@ -68,6 +73,7 @@ struct perf_evsel {
 	u64			*id;
 	struct perf_counts	*counts;
 	struct perf_counts	*prev_raw_counts;
+	struct aggr_counts	*proc_counts;
 	int			idx;
 	u32			ids;
 	char			*name;
@@ -170,8 +176,10 @@ const char *perf_evsel__group_name(struct perf_evsel *evsel);
 int perf_evsel__group_desc(struct perf_evsel *evsel, char *buf, size_t size);
 
 int perf_evsel__alloc_id(struct perf_evsel *evsel, int ncpus, int nthreads);
+int perf_evsel__alloc_aggr_counts(struct perf_evsel *evsel, int n_procs);
 int perf_evsel__alloc_counts(struct perf_evsel *evsel, int ncpus);
 void perf_evsel__reset_counts(struct perf_evsel *evsel, int ncpus);
+void perf_evsel__free_aggr_counts(struct perf_evsel *evsel);
 void perf_evsel__free_counts(struct perf_evsel *evsel);
 void perf_evsel__close_fd(struct perf_evsel *evsel, int ncpus, int nthreads);
 

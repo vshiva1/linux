@@ -3,9 +3,11 @@
 
 #include <sys/types.h>
 #include <stdio.h>
+#include "util.h"
 
 struct thread_map {
 	int nr;
+	int p_nr;
 	pid_t map[];
 };
 
@@ -19,6 +21,10 @@ struct thread_map *thread_map__new_str(const char *pid,
 		const char *tid, uid_t uid);
 
 void thread_map__delete(struct thread_map *threads);
+int thread_map__build_aggr_pid_map(const char *pid_str,
+				    struct proc_map **map,
+				    struct thread_map *threads);
+int thread_map_aggr_tindex(int tindex, struct proc_map *pmap);
 
 size_t thread_map__fprintf(struct thread_map *threads, FILE *fp);
 

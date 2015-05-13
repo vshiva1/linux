@@ -857,6 +857,13 @@ void perf_evsel__reset_counts(struct perf_evsel *evsel, int ncpus)
 				 (ncpus * sizeof(struct perf_counts_values))));
 }
 
+int perf_evsel__alloc_aggr_counts(struct perf_evsel *evsel, int n_procs)
+{
+	evsel->proc_counts = zalloc((sizeof(*evsel->proc_counts) +
+				(n_procs * sizeof(struct perf_counts_values))));
+	return evsel->proc_counts != NULL ? 0 : -ENOMEM;
+}
+
 int perf_evsel__alloc_counts(struct perf_evsel *evsel, int ncpus)
 {
 	evsel->counts = zalloc((sizeof(*evsel->counts) +
@@ -889,6 +896,11 @@ void perf_evsel__close_fd(struct perf_evsel *evsel, int ncpus, int nthreads)
 			close(FD(evsel, cpu, thread));
 			FD(evsel, cpu, thread) = -1;
 		}
+}
+
+void perf_evsel__free_aggr_counts(struct perf_evsel *evsel)
+{
+	zfree(&evsel->proc_counts);
 }
 
 void perf_evsel__free_counts(struct perf_evsel *evsel)
@@ -1302,7 +1314,7 @@ static struct {
 	struct thread_map map;
 	int threads[1];
 } empty_thread_map = {
-	.map.nr	 = 1,
+	{ 1, 1},
 	.threads = { -1, },
 };
 

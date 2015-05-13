@@ -265,6 +265,16 @@ ssize_t writen(int fd, void *buf, size_t n);
 
 struct perf_event_attr;
 
+struct tmap {
+	int tindex;
+	pid_t tgid;
+};
+
+struct proc_map {
+	int nr;
+	struct tmap map[];
+};
+
 void event_attr_init(struct perf_event_attr *attr);
 
 #define _STR(x) #x

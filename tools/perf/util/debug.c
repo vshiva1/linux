@@ -16,7 +16,7 @@
 #define NSECS_PER_SEC  1000000000ULL
 #define NSECS_PER_USEC 1000ULL
 
-int verbose;
+int verbose = 2;
 bool dump_trace = false, quiet = false;
 int debug_ordered_events;
 static int redirect_to_stderr;

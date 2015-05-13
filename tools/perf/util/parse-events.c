@@ -1244,7 +1244,7 @@ static bool is_event_supported(u8 type, unsigned config)
 		struct thread_map map;
 		int threads[1];
 	} tmap = {
-		.map.nr	 = 1,
+		{ 1, 1},
 		.threads = { 0 },
 	};
 

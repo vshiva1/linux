@@ -9,7 +9,6 @@
 #include "strlist.h"
 #include <string.h>
 #include "thread_map.h"
-#include "util.h"
 
 /* Skip "." and ".." directories */
 static int filter(const struct dirent *dir)
@@ -154,13 +153,67 @@ struct thread_map *thread_map__new(pid_t pid, pid_t tid, uid_t uid)
 	return thread_map__new_by_tid(tid);
 }
 
+int thread_map_aggr_tindex(int tindex, struct proc_map *pmap)
+{
+	int len = pmap->nr, i=0;
+	/*
+	 * The array is laid out to use in binary search.
+	 * But the list of pids is only given by user,
+	 * so should not crazy long.
+	 */
+	for (i = 0; i < len; i++) {
+		if (tindex <= pmap->map[i].tindex)
+			return i;
+	}
+
+	return -1;
+}
+
+int thread_map__build_aggr_pid_map(const char *pid_str, 
+				    struct proc_map **map, struct thread_map *threads)
+{
+	char name[256];
+	int items, total_tasks = 0, i=0;
+	struct dirent **namelist = NULL;
+	pid_t pid;
+	char *end_ptr;
+	struct str_node *pos;
+	struct strlist *slist = strlist__new(false, pid_str);
+	struct proc_map *pmap;
+
+	if (!pid_str || !threads)
+		return -1;
+
+	items = threads->p_nr;
+	pmap = malloc(sizeof(*pmap) + sizeof(struct tmap) * items);
+	if (!pmap)
+		return -1;
+
+	pmap->nr = items;
+	strlist__for_each(pos, slist) {
+		pid = strtol(pos->s, &end_ptr, 10);
+
+		sprintf(name, "/proc/%d/task", pid);
+		items = scandir(name, &namelist, filter, NULL);
+
+		total_tasks += items;
+
+		pmap->map[i].tindex = total_tasks - 1;
+		pmap->map[i].tgid = pid;
+		i++;
+	}
+	*map = pmap;
+
+	return 0;
+}
+
 static struct thread_map *thread_map__new_by_pid_str(const char *pid_str)
 {
 	struct thread_map *threads = NULL, *nt;
 	char name[256];
 	int items, total_tasks = 0;
 	struct dirent **namelist = NULL;
-	int i, j = 0;
+	int i, j = 0, pcount=0;
 	pid_t pid, prev_pid = INT_MAX;
 	char *end_ptr;
 	struct str_node *pos;
@@ -197,9 +250,11 @@ static struct thread_map *thread_map__new_by_pid_str(const char *pid_str)
 			zfree(&namelist[i]);
 		}
 		threads->nr = total_tasks;
+		pcount += 1;
 		free(namelist);
 	}
 
+	threads->p_nr = pcount;
 out:
 	strlist__delete(slist);
 	return threads;

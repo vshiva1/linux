@@ -48,6 +48,11 @@ enum target_errno target__parse_uid(struct target *target);
 
 int target__strerror(struct target *target, int errnum, char *buf, size_t buflen);
 
+static inline bool target__has_pid(struct target *target)
+{
+	return target->pid;
+}
+
 static inline bool target__has_task(struct target *target)
 {
 	return target->tid || target->pid || target->uid_str;
