@@ -561,6 +561,8 @@ static int __init intel_rdt_late_init(void)
 
 	static_key_slow_inc(&rdt_enable_key);
 	pr_info("Intel cache allocation enabled\n");
+	if (cpu_has(c, X86_FEATURE_CDP_L3))
+		pr_info("Intel code data prioritization detected\n");
 out_err:
 
 	return err;

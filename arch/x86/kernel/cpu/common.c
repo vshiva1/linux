@@ -665,6 +665,7 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
 			cpuid_count(0x00000010, 1, &eax, &ebx, &ecx, &edx);
 			c->x86_cache_max_closid = edx + 1;
 			c->x86_cache_max_cbm_len = eax + 1;
+			c->x86_capability[14] = ecx;
 		}
 	}
 
