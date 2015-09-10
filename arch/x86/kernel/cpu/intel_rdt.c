@@ -34,10 +34,6 @@
  */
 static struct clos_cbm_table *cctable;
 /*
- * closid availability bit map.
- */
-unsigned long *closmap;
-/*
  * Minimum bits required in Cache bitmask.
  */
 static unsigned int min_bitmask_len = 1;
@@ -52,6 +48,11 @@ static cpumask_t rdt_cpumask;
 static cpumask_t tmp_cpumask;
 static DEFINE_MUTEX(rdt_group_mutex);
 struct static_key __read_mostly rdt_enable_key = STATIC_KEY_INIT_FALSE;
+struct clos_config cconfig;
+static bool cdp_enabled;
+
+#define __DCBM_TABLE_INDEX(x)	(x << 1)
+#define __ICBM_TABLE_INDEX(x)	((x << 1) + 1)
 
 struct intel_rdt rdt_root_group;
 #define rdt_for_each_child(pos_css, parent_ir)		\
@@ -148,22 +149,28 @@ static int closid_alloc(u32 *closid)
 
 	lockdep_assert_held(&rdt_group_mutex);
 
-	maxid = boot_cpu_data.x86_cache_max_closid;
-	id = find_first_zero_bit(closmap, maxid);
+	maxid = cconfig.max_closid;
+	id = find_first_zero_bit(cconfig.closmap, maxid);
 	if (id == maxid)
 		return -ENOSPC;
 
-	set_bit(id, closmap);
+	set_bit(id, cconfig.closmap);
 	closid_get(id);
 	*closid = id;
+	cconfig.closids_used++;
 
 	return 0;
 }
 
 static inline void closid_free(u32 closid)
 {
-	clear_bit(closid, closmap);
+	clear_bit(closid, cconfig.closmap);
 	cctable[closid].l3_cbm = 0;
+
+	if (WARN_ON(!cconfig.closids_used))
+		return;
+
+	cconfig.closids_used--;
 }
 
 static void closid_put(u32 closid)
@@ -200,45 +207,45 @@ static bool cbm_validate(unsigned long var)
 	return true;
 }
 
-static int clos_cbm_table_read(u32 closid, unsigned long *l3_cbm)
+static int clos_cbm_table_read(u32 index, unsigned long *l3_cbm)
 {
-	u32 maxid = boot_cpu_data.x86_cache_max_closid;
+	u32 orig_maxid = boot_cpu_data.x86_cache_max_closid;
 
 	lockdep_assert_held(&rdt_group_mutex);
 
-	if (closid >= maxid)
+	if (index >= orig_maxid)
 		return -EINVAL;
 
-	*l3_cbm = cctable[closid].l3_cbm;
+	*l3_cbm = cctable[index].l3_cbm;
 
 	return 0;
 }
 
 /*
  * clos_cbm_table_update() - Update a clos cbm table entry.
- * @closid: the closid whose cbm needs to be updated
+ * @index: index of the table entry whose cbm needs to be updated
  * @cbm: the new cbm value that has to be updated
  *
  * This assumes the cbm is validated as per the interface requirements
  * and the cache allocation requirements(through the cbm_validate).
  */
-static int clos_cbm_table_update(u32 closid, unsigned long cbm)
+static int clos_cbm_table_update(u32 index, unsigned long cbm)
 {
-	u32 maxid = boot_cpu_data.x86_cache_max_closid;
+	u32 orig_maxid = boot_cpu_data.x86_cache_max_closid;
 
 	lockdep_assert_held(&rdt_group_mutex);
 
-	if (closid >= maxid)
+	if (index >= orig_maxid)
 		return -EINVAL;
 
-	cctable[closid].l3_cbm = cbm;
+	cctable[index].l3_cbm = cbm;
 
 	return 0;
 }
 
 static bool cbm_search(unsigned long cbm, u32 *closid)
 {
-	u32 maxid = boot_cpu_data.x86_cache_max_closid;
+	u32 maxid = cconfig.max_closid;
 	u32 i;
 
 	for (i = 0; i < maxid; i++) {
@@ -282,6 +289,67 @@ static inline void msr_update_all(int msr, u64 val)
 	on_each_cpu_mask(&rdt_cpumask, msr_cpu_update, &info, 1);
 }
 
+static bool code_data_mask_equal(void)
+{
+	int i, dindex, iindex;
+
+	for (i = 0; i < cconfig.max_closid; i++) {
+		dindex = __DCBM_TABLE_INDEX(i);
+		iindex = __ICBM_TABLE_INDEX(i);
+		if (cctable[dindex].clos_refcnt &&
+		     (cctable[dindex].l3_cbm != cctable[iindex].l3_cbm))
+			return false;
+	}
+
+	return true;
+}
+
+static void __switch_mode_cdp(bool cdpenable)
+{
+	u32 max_cbm_len = boot_cpu_data.x86_cache_max_cbm_len;
+	u32 orig_maxid = boot_cpu_data.x86_cache_max_closid;
+	u32 max_cbm, i;
+
+	max_cbm = (1ULL << max_cbm_len) - 1;
+	for (i = 0; i < orig_maxid; i++)
+		msr_update_all(CBM_FROM_INDEX(i), max_cbm);
+
+	msr_update_all(MSR_IA32_PQOS_CFG, cdpenable);
+
+	if (cdpenable)
+		cconfig.max_closid = cconfig.max_closid >> 1;
+	else
+		cconfig.max_closid = cconfig.max_closid << 1;
+	cdp_enabled = cdpenable;
+}
+
+/*
+ * switch_mode_cdp() - switch between legacy cache alloc and cdp modes
+ * @cdpmode: '0' to disable cdp and '1' to enable cdp
+ *
+ * cdp is enabled only when the number of closids used is less than half
+ * of available closids. Switch to legacy cache alloc mode when
+ * for each (dcache_cbm,icache_cbm) pair, the dcache_cbm = icache_cbm.
+ */
+static int switch_mode_cdp(bool cdpenable)
+{
+	struct cpuinfo_x86 *c = &boot_cpu_data;
+	u32 maxid = cconfig.max_closid;
+
+	lockdep_assert_held(&rdt_group_mutex);
+
+	if (!cpu_has(c, X86_FEATURE_CDP_L3) || cdpenable == cdp_enabled)
+		return -EINVAL;
+
+	if ((cdpenable && (cconfig.closids_used >= (maxid >> 1))) ||
+	     (!cdpenable && !code_data_mask_equal()))
+		return -ENOSPC;
+
+	__switch_mode_cdp(cdpenable);
+
+	return 0;
+}
+
 static inline bool rdt_cpumask_update(int cpu)
 {
 	cpumask_and(&tmp_cpumask, &rdt_cpumask, topology_core_cpumask(cpu));
@@ -299,7 +367,7 @@ static inline bool rdt_cpumask_update(int cpu)
  */
 static void cbm_update_msrs(void *dummy)
 {
-	int maxid = boot_cpu_data.x86_cache_max_closid;
+	int maxid = cconfig.max_closid;
 	struct rdt_remote_data info;
 	unsigned int i;
 
@@ -307,7 +375,7 @@ static void cbm_update_msrs(void *dummy)
 		if (cctable[i].clos_refcnt) {
 			info.msr = CBM_FROM_INDEX(i);
 			info.val = cctable[i].l3_cbm;
-			msr_cpu_update(&info);
+			msr_cpu_update((void *) &info);
 		}
 	}
 }
@@ -542,8 +610,8 @@ static int __init intel_rdt_late_init(void)
 	}
 
 	size = BITS_TO_LONGS(maxid) * sizeof(long);
-	closmap = kzalloc(size, GFP_KERNEL);
-	if (!closmap) {
+	cconfig.closmap = kzalloc(size, GFP_KERNEL);
+	if (!cconfig.closmap) {
 		kfree(cctable);
 		err = -ENOMEM;
 		goto out_err;

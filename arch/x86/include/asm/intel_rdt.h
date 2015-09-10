@@ -8,6 +8,7 @@
 #define MAX_CBM_LENGTH			32
 #define IA32_L3_CBM_BASE		0xc90
 #define CBM_FROM_INDEX(x)		(IA32_L3_CBM_BASE + x)
+#define MSR_IA32_PQOS_CFG		0xc81
 
 extern struct static_key rdt_enable_key;
 void __intel_rdt_sched_in(void *dummy);
@@ -20,6 +21,12 @@ struct intel_rdt {
 struct clos_cbm_table {
 	unsigned long l3_cbm;
 	unsigned int clos_refcnt;
+};
+
+struct clos_config {
+	unsigned long *closmap;
+	u32 max_closid;
+	u32 closids_used;
 };
 
 /*
