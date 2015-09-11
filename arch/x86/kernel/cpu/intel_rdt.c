@@ -30,7 +30,13 @@
 #include <asm/intel_rdt.h>
 
 /*
- * cctable maintains 1:1 mapping between CLOSid and cache bitmask.
+ * During cache alloc mode cctable maintains 1:1 mapping between
+ * CLOSid and l3_cbm.
+ *
+ * During CDP mode, the cctable maintains a 1:2 mapping between the closid
+ * and (dcache_cbm, icache_cbm) pair.
+ * index of a dcache_cbm for CLOSid 'n' = n << 1.
+ * index of a icache_cbm for CLOSid 'n' = n << 1 + 1
  */
 static struct clos_cbm_table *cctable;
 /*
@@ -53,6 +59,13 @@ static bool cdp_enabled;
 
 #define __DCBM_TABLE_INDEX(x)	(x << 1)
 #define __ICBM_TABLE_INDEX(x)	((x << 1) + 1)
+#define __DCBM_MSR_INDEX(x)			\
+	CBM_FROM_INDEX(__DCBM_TABLE_INDEX(x))
+#define __ICBM_MSR_INDEX(x)			\
+	CBM_FROM_INDEX(__ICBM_TABLE_INDEX(x))
+
+#define DCBM_TABLE_INDEX(x)	(x << cdp_enabled)
+#define ICBM_TABLE_INDEX(x)	((x << cdp_enabled) + cdp_enabled)
 
 struct intel_rdt rdt_root_group;
 #define rdt_for_each_child(pos_css, parent_ir)		\
@@ -133,9 +146,12 @@ static inline void closid_tasks_sync(void)
 	on_each_cpu_mask(cpu_online_mask, __intel_rdt_sched_in, NULL, 1);
 }
 
+/*
+ * When cdp mode is enabled, refcnt is maintained in the dcache_cbm entry.
+ */
 static inline void closid_get(u32 closid)
 {
-	struct clos_cbm_table *cct = &cctable[closid];
+	struct clos_cbm_table *cct = &cctable[DCBM_TABLE_INDEX(closid)];
 
 	lockdep_assert_held(&rdt_group_mutex);
 
@@ -165,7 +181,7 @@ static int closid_alloc(u32 *closid)
 static inline void closid_free(u32 closid)
 {
 	clear_bit(closid, cconfig.closmap);
-	cctable[closid].l3_cbm = 0;
+	cctable[DCBM_TABLE_INDEX(closid)].l3_cbm = 0;
 
 	if (WARN_ON(!cconfig.closids_used))
 		return;
@@ -175,7 +191,7 @@ static inline void closid_free(u32 closid)
 
 static void closid_put(u32 closid)
 {
-	struct clos_cbm_table *cct = &cctable[closid];
+	struct clos_cbm_table *cct = &cctable[DCBM_TABLE_INDEX(closid)];
 
 	lockdep_assert_held(&rdt_group_mutex);
 	if (WARN_ON(!cct->clos_refcnt))
@@ -259,6 +275,30 @@ static bool cbm_search(unsigned long cbm, u32 *closid)
 	return false;
 }
 
+static bool cbm_pair_search(unsigned long dcache_cbm, unsigned long icache_cbm,
+			    u32 *closid)
+{
+	u32 maxid = cconfig.max_closid;
+	unsigned long dcbm, icbm;
+	u32 i, dindex, iindex;
+
+	for (i = 0; i < maxid; i++) {
+		dindex = __DCBM_TABLE_INDEX(i);
+		iindex = __ICBM_TABLE_INDEX(i);
+		dcbm = cctable[dindex].l3_cbm;
+		icbm = cctable[iindex].l3_cbm;
+
+		if (cctable[dindex].clos_refcnt &&
+		    bitmap_equal(&dcache_cbm, &dcbm, MAX_CBM_LENGTH) &&
+		    bitmap_equal(&icache_cbm, &icbm, MAX_CBM_LENGTH)) {
+			*closid = i;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static void closcbm_map_dump(void)
 {
 	u32 i;
@@ -287,6 +327,93 @@ static inline void msr_update_all(int msr, u64 val)
 	info.msr = msr;
 	info.val = val;
 	on_each_cpu_mask(&rdt_cpumask, msr_cpu_update, &info, 1);
+}
+
+/*
+ * clos_cbm_table_df() - Defragments the clos_cbm_table entries
+ * @ct: The clos_cbm_table to which the defragmented entries are copied.
+ *
+ * The max entries in ct is never > original max closids / 2.
+ */
+static void clos_cbm_table_df(struct clos_cbm_table *ct)
+{
+	u32 orig_maxid = boot_cpu_data.x86_cache_max_closid;
+	int i, j;
+
+	for (i = 0, j = 0; i < orig_maxid; i++) {
+		if (cctable[i].clos_refcnt) {
+			ct[j] = cctable[i];
+			set_bit(j, cconfig.closmap);
+			j++;
+		}
+	}
+}
+
+/*
+ * post_cdp_enable() - This sets up the clos_cbm_table and
+ * IA32_L3_MASK_n MSRs before starting to use CDP.
+ *
+ * The existing l3_cbm entries are retained as dcache_cbm and
+ * icache_cbm entries. The IA32_L3_QOS_n MSRs are also updated
+ * as they were reset to all 1s before mode change.
+ */
+static int post_cdp_enable(void)
+{
+	u32 orig_maxid = boot_cpu_data.x86_cache_max_closid;
+	u32 maxid = cconfig.max_closid;
+	int size, dindex, iindex, i;
+	struct clos_cbm_table *ct;
+
+	maxid = cconfig.max_closid;
+	size = maxid * sizeof(struct clos_cbm_table);
+	ct = kzalloc(size, GFP_KERNEL);
+	if (!ct)
+		return -ENOMEM;
+
+	bitmap_zero(cconfig.closmap, orig_maxid);
+	clos_cbm_table_df(ct);
+
+	for (i = 0; i < maxid; i++) {
+		if (ct[i].clos_refcnt) {
+			msr_update_all(__DCBM_MSR_INDEX(i), ct[i].l3_cbm);
+			msr_update_all(__ICBM_MSR_INDEX(i), ct[i].l3_cbm);
+		}
+		dindex = __DCBM_TABLE_INDEX(i);
+		iindex = __ICBM_TABLE_INDEX(i);
+		cctable[dindex] = cctable[iindex] = ct[i];
+	}
+	kfree(ct);
+
+	return 0;
+}
+
+/*
+ * post_cdp_disable() - Set the state of closmap and clos_cbm_table
+ * before using the cache alloc mode.
+ *
+ * The existing dcache_cbm entries are retained as l3_cbm entries.
+ * The IA32_L3_QOS_n MSRs are also updated
+ * as they were reset to all 1s before mode change.
+ */
+static void post_cdp_disable(void)
+{
+	int dindex, maxid, i;
+
+	maxid = cconfig.max_closid >> 1;
+	for (i = 0; i < maxid; i++) {
+		dindex = __DCBM_TABLE_INDEX(i);
+		if (cctable[dindex].clos_refcnt)
+			msr_update_all(CBM_FROM_INDEX(i),
+					 cctable[dindex].l3_cbm);
+
+		cctable[i] = cctable[dindex];
+	}
+
+	/*
+	 * We updated half of the clos_cbm_table entries, initialize the
+	 * rest of the clos_cbm_table entries.
+	 */
+	memset(&cctable[maxid], 0, maxid * sizeof(struct clos_cbm_table));
 }
 
 static bool code_data_mask_equal(void)
@@ -335,6 +462,7 @@ static int switch_mode_cdp(bool cdpenable)
 {
 	struct cpuinfo_x86 *c = &boot_cpu_data;
 	u32 maxid = cconfig.max_closid;
+	int err = 0;
 
 	lockdep_assert_held(&rdt_group_mutex);
 
@@ -347,7 +475,19 @@ static int switch_mode_cdp(bool cdpenable)
 
 	__switch_mode_cdp(cdpenable);
 
-	return 0;
+	/*
+	 * After mode switch to cdp, the index for IA32_L3_MASK_n from the base
+	 * for a CLOSid 'n' is:
+	 * dcache_cbm_index (n) = (n << 1)
+	 * icache_cbm_index (n) = (n << 1) +1
+	 */
+	if (cdpenable)
+		err = post_cdp_enable();
+	else
+		post_cdp_disable();
+	closcbm_map_dump();
+
+	return err;
 }
 
 static inline bool rdt_cpumask_update(int cpu)
