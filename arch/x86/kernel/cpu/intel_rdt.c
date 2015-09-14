@@ -329,6 +329,24 @@ static inline void msr_update_all(int msr, u64 val)
 	on_each_cpu_mask(&rdt_cpumask, msr_cpu_update, &info, 1);
 }
 
+static void cgroup_rdt_closid_update(struct intel_rdt *par,
+				     u32 oldclosid, u32 newclosid)
+{
+	struct cgroup_subsys_state *css;
+	struct intel_rdt *c;
+
+	if (par == NULL || oldclosid == newclosid)
+		return;
+
+	if (par->closid == oldclosid)
+		par->closid = newclosid;
+
+	rdt_for_each_child(css, par) {
+		c = css_rdt(css);
+		cgroup_rdt_closid_update(c, oldclosid, newclosid);
+	}
+}
+
 /*
  * clos_cbm_table_df() - Defragments the clos_cbm_table entries
  * @ct: The clos_cbm_table to which the defragmented entries are copied.
@@ -344,6 +362,9 @@ static void clos_cbm_table_df(struct clos_cbm_table *ct)
 		if (cctable[i].clos_refcnt) {
 			ct[j] = cctable[i];
 			set_bit(j, cconfig.closmap);
+			rcu_read_lock();
+			cgroup_rdt_closid_update(&rdt_root_group, i, j);
+			rcu_read_unlock();
 			j++;
 		}
 	}
@@ -621,31 +642,55 @@ static void intel_rdt_css_free(struct cgroup_subsys_state *css)
 	mutex_unlock(&rdt_group_mutex);
 }
 
-static int intel_cache_alloc_cbm_read(struct seq_file *m, void *v)
+static inline u32 dcbm_table_index(u32 closid)
+{
+	return DCBM_TABLE_INDEX(closid);
+}
+
+static inline u32 icbm_table_index(u32 closid)
+{
+	return ICBM_TABLE_INDEX(closid);
+}
+
+static int cbm_read_common(struct seq_file *m, u32 (*clos_fn)(u32))
 {
 	struct intel_rdt *ir = css_rdt(seq_css(m));
 	unsigned long l3_cbm = 0;
 
-	clos_cbm_table_read(ir->closid, &l3_cbm);
+	clos_cbm_table_read(clos_fn(ir->closid), &l3_cbm);
 	seq_printf(m, "%08lx\n", l3_cbm);
 
 	return 0;
 }
 
-static int cbm_validate_rdt_cgroup(struct intel_rdt *ir, unsigned long cbmvalue)
+/*
+ * Reads the dcache_cbm when cdp is enabled.
+ */
+static int intel_cache_alloc_cbm_read(struct seq_file *m, void *v)
+{
+	return cbm_read_common(m, dcbm_table_index);
+}
+
+static int cdp_dcache_cbm_read(struct seq_file *m, void *v)
+{
+	return cbm_read_common(m, dcbm_table_index);
+}
+
+static int cdp_icache_cbm_read(struct seq_file *m, void *v)
+{
+	return cbm_read_common(m, icbm_table_index);
+}
+
+static int cbm_validate_rdt_cgroup(struct intel_rdt *ir, unsigned long cbmvalue,
+				    u32 (*clos_fn)(u32))
 {
 	struct cgroup_subsys_state *css;
 	struct intel_rdt *par, *c;
 	unsigned long cbm_tmp = 0;
 	int err = 0;
 
-	if (!cbm_validate(cbmvalue)) {
-		err = -EINVAL;
-		goto out_err;
-	}
-
 	par = parent_rdt(ir);
-	clos_cbm_table_read(par->closid, &cbm_tmp);
+	clos_cbm_table_read(clos_fn(par->closid), &cbm_tmp);
 	if (!bitmap_subset(&cbmvalue, &cbm_tmp, MAX_CBM_LENGTH)) {
 		err = -EINVAL;
 		goto out_err;
@@ -654,7 +699,7 @@ static int cbm_validate_rdt_cgroup(struct intel_rdt *ir, unsigned long cbmvalue)
 	rcu_read_lock();
 	rdt_for_each_child(css, ir) {
 		c = css_rdt(css);
-		clos_cbm_table_read(par->closid, &cbm_tmp);
+		clos_cbm_table_read(clos_fn(c->closid), &cbm_tmp);
 		if (!bitmap_subset(&cbm_tmp, &cbmvalue, MAX_CBM_LENGTH)) {
 			rcu_read_unlock();
 			err = -EINVAL;
@@ -663,6 +708,76 @@ static int cbm_validate_rdt_cgroup(struct intel_rdt *ir, unsigned long cbmvalue)
 	}
 	rcu_read_unlock();
 out_err:
+
+	return err;
+}
+
+static inline int closid_alloc_try_cdpdisable(struct intel_rdt *ir,
+					       u64 dcache_mask,
+					       u64 icache_mask)
+{
+	int err = 0;
+
+	err = closid_alloc(&ir->closid);
+	if (err && (dcache_mask == icache_mask)) {
+		/*
+		 * Can try allocating again after disabling cdp.
+		 * This is an attempt to see if all the dcache and icache
+		 * masks are going to be same and hence can free more
+		 * closids by switching to cache alloc mode.
+		 */
+		if (!switch_mode_cdp(false))
+			err = closid_alloc(&ir->closid);
+	}
+
+	return err;
+}
+
+static inline void dcache_icache_cbm_read(u32 closid, unsigned long *dcbm,
+			       unsigned long *icbm)
+{
+	clos_cbm_table_read(__DCBM_TABLE_INDEX(closid), dcbm);
+	clos_cbm_table_read(__ICBM_TABLE_INDEX(closid), icbm);
+}
+
+static int cdp_mask_write(struct intel_rdt *ir, u64 dcache_mask,
+			  u64 icache_mask)
+{
+	u32 dindex, iindex;
+	int err = 0;
+	u32 closid;
+
+	/*
+	 * Try to get a reference for a different CLOSid and release the
+	 * reference to the current CLOSid.
+	 * Need to put down the reference here and get it back in case we
+	 * run out of closids. Otherwise we run into a problem when
+	 * we could be using the last closid that could have been available.
+	 */
+	closid_put(ir->closid);
+	if (cbm_pair_search(dcache_mask, icache_mask, &closid)) {
+		ir->closid = closid;
+		closid_get(closid);
+	} else {
+		err = closid_alloc_try_cdpdisable(ir, dcache_mask, icache_mask);
+		if (err) {
+			closid_get(ir->closid);
+			goto out;
+		}
+		closid = ir->closid;
+		dindex = DCBM_TABLE_INDEX(closid);
+		clos_cbm_table_update(dindex, dcache_mask);
+		msr_update_all(CBM_FROM_INDEX(dindex), dcache_mask);
+
+		if (cdp_enabled) {
+			iindex = ICBM_TABLE_INDEX(closid);
+			clos_cbm_table_update(iindex, icache_mask);
+			msr_update_all(CBM_FROM_INDEX(iindex), icache_mask);
+		}
+	}
+	closid_tasks_sync();
+	closcbm_map_dump();
+out:
 
 	return err;
 }
@@ -693,11 +808,39 @@ static int intel_cache_alloc_cbm_write(struct cgroup_subsys_state *css,
 	 */
 	mutex_lock(&rdt_group_mutex);
 
+	if (!cbm_validate(cbmvalue)) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	/*
+	 * A write to l3_cbm when cdp is enabled writes to both
+	 * dcache_cbm and icache_cbm.
+	 */
+	if (cdp_enabled) {
+		unsigned long cdm, cim;
+
+		dcache_icache_cbm_read(ir->closid, &cdm, &cim);
+		if (cbmvalue == cdm && cbmvalue == cim)
+			goto out;
+
+		err = cbm_validate_rdt_cgroup(ir, cbmvalue, dcbm_table_index);
+		if (err)
+			goto out;
+
+		err = cbm_validate_rdt_cgroup(ir, cbmvalue, icbm_table_index);
+		if (err)
+			goto out;
+
+		err = cdp_mask_write(ir, cbmvalue, cbmvalue);
+		goto out;
+	}
+
 	clos_cbm_table_read(ir->closid, &ccbm);
 	if (cbmvalue == ccbm)
 		goto out;
 
-	err = cbm_validate_rdt_cgroup(ir, cbmvalue);
+	err = cbm_validate_rdt_cgroup(ir, cbmvalue, dcbm_table_index);
 	if (err)
 		goto out;
 
@@ -731,22 +874,152 @@ out:
 	return err;
 }
 
-static void rdt_cgroup_init(void)
+/*
+ * A write to the dcache_cbm may trigger a cdp mode switch
+ */
+static int cdp_dcache_cbm_write(struct cgroup_subsys_state *css,
+				 struct cftype *cft, u64 new_dcache_mask)
+{
+	unsigned long curr_icache_mask, curr_dcache_mask;
+	struct intel_rdt *ir = css_rdt(css);
+	int err = 0;
+
+	if (ir == &rdt_root_group)
+		return -EPERM;
+
+	/*
+	 * Need global mutex as cache mask write may allocate a closid.
+	 */
+	mutex_lock(&rdt_group_mutex);
+
+	if (!cbm_validate(new_dcache_mask)) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	if (!cdp_enabled) {
+		err = switch_mode_cdp(true);
+		if (err)
+			goto out;
+	}
+
+	dcache_icache_cbm_read(ir->closid, &curr_dcache_mask, &curr_icache_mask);
+	if (new_dcache_mask == curr_dcache_mask)
+		goto out;
+
+	err = cbm_validate_rdt_cgroup(ir, new_dcache_mask, dcbm_table_index);
+	if (err)
+		goto out;
+
+	err = cdp_mask_write(ir, new_dcache_mask, curr_icache_mask);
+out:
+	mutex_unlock(&rdt_group_mutex);
+
+	return err;
+}
+
+/*
+ * A write to the icache_cbm may trigger a cdp mode switch
+ */
+static int cdp_icache_cbm_write(struct cgroup_subsys_state *css,
+				 struct cftype *cft, u64 new_icache_mask)
+{
+	unsigned long curr_icache_mask, curr_dcache_mask;
+	struct intel_rdt *ir = css_rdt(css);
+	int err = 0;
+
+	if (ir == &rdt_root_group)
+		return -EPERM;
+
+	/*
+	 * Need global mutex as cache mask write may allocate a closid.
+	 */
+	mutex_lock(&rdt_group_mutex);
+
+	if (!cbm_validate(new_icache_mask)) {
+		err = -EINVAL;
+		goto out;
+	}
+
+	if (!cdp_enabled) {
+		err = switch_mode_cdp(true);
+		if (err)
+			goto out;
+	}
+
+	dcache_icache_cbm_read(ir->closid, &curr_dcache_mask, &curr_icache_mask);
+	if (new_icache_mask == curr_icache_mask)
+		goto out;
+
+	err = cbm_validate_rdt_cgroup(ir, new_icache_mask, icbm_table_index);
+	if (err)
+		goto out;
+
+	err = cdp_mask_write(ir, curr_dcache_mask, new_icache_mask);
+out:
+	mutex_unlock(&rdt_group_mutex);
+
+	return err;
+}
+
+static struct cftype *rdt_files;
+
+struct cgroup_subsys intel_rdt_cgrp_subsys = {
+	.css_alloc		= intel_rdt_css_alloc,
+	.css_free		= intel_rdt_css_free,
+	.early_init		= 0,
+};
+
+static int rdt_cgroup_init(bool cdpsupported)
 {
 	int max_cbm_len = boot_cpu_data.x86_cache_max_cbm_len;
+	struct cftype *cft;
+	int size, i = 0;
 	u32 closid;
 
+	size = (2 << cdpsupported) * sizeof(struct cftype);
+	rdt_files = kzalloc(size , GFP_KERNEL);
+
+	if (!rdt_files) {
+		rdt_root_group.css.ss->disabled = 1;
+		return -ENOMEM;
+	}
+
+	cft = &rdt_files[i++];
+	snprintf(cft->name, MAX_CFTYPE_NAME, "l3_cbm");
+	cft->seq_show = intel_cache_alloc_cbm_read;
+	cft->write_u64 = intel_cache_alloc_cbm_write;
+
+	if (cdpsupported) {
+		cft = &rdt_files[i++];
+		snprintf(cft->name, MAX_CFTYPE_NAME, "dcache_cbm");
+		cft->seq_show = cdp_dcache_cbm_read;
+		cft->write_u64 = cdp_dcache_cbm_write;
+
+		cft = &rdt_files[i++];
+		snprintf(cft->name, MAX_CFTYPE_NAME, "icache_cbm");
+		cft->seq_show = cdp_icache_cbm_read;
+		cft->write_u64 = cdp_icache_cbm_write;
+	}
+
+	cft = &rdt_files[i];
+	memset(cft, 0, sizeof(*cft));
+
 	closid_alloc(&closid);
-
-	WARN_ON(closid != 0);
-
 	rdt_root_group.closid = closid;
 	clos_cbm_table_update(closid, (1ULL << max_cbm_len) - 1);
+
+	WARN_ON(closid != 0);
+	WARN_ON(cgroup_add_legacy_cftypes(&intel_rdt_cgrp_subsys,
+					  rdt_files));
+
+	return 0;
 }
 
 static int __init intel_rdt_late_init(void)
 {
 	struct cpuinfo_x86 *c = &boot_cpu_data;
+	bool cdpsupported = false;
 	u32 maxid, max_cbm_len;
 	int err = 0, size, i;
 
@@ -754,7 +1027,7 @@ static int __init intel_rdt_late_init(void)
 		rdt_root_group.css.ss->disabled = 1;
 		return -ENODEV;
 	}
-	maxid = c->x86_cache_max_closid;
+	maxid = cconfig.max_closid = c->x86_cache_max_closid;
 	max_cbm_len = c->x86_cache_max_cbm_len;
 
 	size = maxid * sizeof(struct clos_cbm_table);
@@ -780,31 +1053,18 @@ static int __init intel_rdt_late_init(void)
 	__hotcpu_notifier(intel_rdt_cpu_notifier, 0);
 
 	cpu_notifier_register_done();
-	rdt_cgroup_init();
 
 	static_key_slow_inc(&rdt_enable_key);
 	pr_info("Intel cache allocation enabled\n");
-	if (cpu_has(c, X86_FEATURE_CDP_L3))
+	if (cpu_has(c, X86_FEATURE_CDP_L3)) {
+		cdpsupported = true;
 		pr_info("Intel code data prioritization detected\n");
+	}
+	rdt_cgroup_init(cdpsupported);
+
 out_err:
 
 	return err;
 }
 
 late_initcall(intel_rdt_late_init);
-
-static struct cftype rdt_files[] = {
-	{
-		.name		= "l3_cbm",
-		.seq_show	= intel_cache_alloc_cbm_read,
-		.write_u64	= intel_cache_alloc_cbm_write,
-	},
-	{ }	/* terminate */
-};
-
-struct cgroup_subsys intel_rdt_cgrp_subsys = {
-	.css_alloc		= intel_rdt_css_alloc,
-	.css_free		= intel_rdt_css_free,
-	.legacy_cftypes		= rdt_files,
-	.early_init		= 0,
-};
