@@ -18,6 +18,13 @@
 
 #define RC_DEBUG(x) pr_info x
 
+#define __init_rr(old_rmid, config, val) 		\
+			(struct rmid_read) {		\
+			.rmid = old_rmid,		\
+			.evt_type = config,		\
+			.value = ATOMIC64_INIT(val),	\
+			}
+
 /*
  * Guaranteed time in ms as per SDM where MBM counters will not overflow.
  */
@@ -140,7 +147,7 @@ static cpumask_t cqm_cpumask;
  */
 static inline bool __rmid_valid(u32 rmid)
 {
-	if (!rmid || rmid == INVALID_RMID)
+	if (rmid == INVALID_RMID)
 		return false;
 
 	return true;
@@ -391,95 +398,10 @@ static inline struct perf_cgroup *event_to_cgroup(struct perf_event *event)
 }
 #endif
 
-/*
- * Determine if @a's tasks intersect with @b's tasks
- *
- * There are combinations of events that we explicitly prohibit,
- *
- *		   PROHIBITS
- *     system-wide    -> 	cgroup and task
- *     cgroup 	      ->	system-wide
- *     		      ->	task in cgroup
- *     task 	      -> 	system-wide
- *     		      ->	task in cgroup
- *
- * Call this function before allocating an RMID.
- */
-static bool __conflict_event(struct perf_event *a, struct perf_event *b)
-{
-#ifdef CONFIG_CGROUP_PERF
-	/*
-	 * We can have any number of cgroups but only one system-wide
-	 * event at a time.
-	 */
-	if (a->cgrp && b->cgrp) {
-		struct perf_cgroup *ac = a->cgrp;
-		struct perf_cgroup *bc = b->cgrp;
-
-		/*
-		 * This condition should have been caught in
-		 * __match_event() and we should be sharing an RMID.
-		 */
-		WARN_ON_ONCE(ac == bc);
-
-		if (cgroup_is_descendant(ac->css.cgroup, bc->css.cgroup) ||
-		    cgroup_is_descendant(bc->css.cgroup, ac->css.cgroup))
-			return true;
-
-		return false;
-	}
-
-	if (a->cgrp || b->cgrp) {
-		struct perf_cgroup *ac, *bc;
-
-		/*
-		 * cgroup and system-wide events are mutually exclusive
-		 */
-		if ((a->cgrp && !(b->attach_state & PERF_ATTACH_TASK)) ||
-		    (b->cgrp && !(a->attach_state & PERF_ATTACH_TASK)))
-			return true;
-
-		/*
-		 * Ensure neither event is part of the other's cgroup
-		 */
-		ac = event_to_cgroup(a);
-		bc = event_to_cgroup(b);
-		if (ac == bc)
-			return true;
-
-		/*
-		 * Must have cgroup and non-intersecting task events.
-		 */
-		if (!ac || !bc)
-			return false;
-
-		/*
-		 * We have cgroup and task events, and the task belongs
-		 * to a cgroup. Check for for overlap.
-		 */
-		if (cgroup_is_descendant(ac->css.cgroup, bc->css.cgroup) ||
-		    cgroup_is_descendant(bc->css.cgroup, ac->css.cgroup))
-			return true;
-
-		return false;
-	}
-#endif
-	/*
-	 * If one of them is not a task, same story as above with cgroups.
-	 */
-	if (!(a->attach_state & PERF_ATTACH_TASK) ||
-	    !(b->attach_state & PERF_ATTACH_TASK))
-		return true;
-
-	/*
-	 * Must be non-overlapping.
-	 */
-	return false;
-}
-
 struct rmid_read {
 	u32 rmid;
 	u32 evt_type;
+	bool reset;
 	atomic64_t value;
 };
 
@@ -507,48 +429,48 @@ static u32 intel_cqm_xchg_rmid(struct perf_event *group, u32 rmid)
 {
 	struct perf_event *event;
 	struct list_head *head = &group->hw.cqm_group_entry;
-	u32 old_rmid = group->hw.cqm_rmid;
+	u32 old_rmid = group->hw.cqm_rmid, evttype;
 	struct rmid_read rr;
+	u64 tmpval;
 
 	lockdep_assert_held(&cache_mutex);
 
 	/*
 	 * If our RMID is being deallocated, perform a read now.
+	 * Also mark the event as having recycled rmid.
 	 */
 	if (__rmid_valid(old_rmid) && !__rmid_valid(rmid)) {
-		rr = (struct rmid_read) {
-			.rmid = old_rmid,
-			.evt_type = group->attr.config,
-			.value = ATOMIC64_INIT(0),
-			};
+		rr = __init_rr(old_rmid, group->attr.config, 0);
 
 		cqm_mask_call(&rr);
 
-		if (is_mbm_event(group->attr.config))
-			local64_add(atomic64_read(&rr.value), &group->count);
-		else
+		group->hw.rmid_rc = true;
+		if (is_mbm_event(group->attr.config)) {
+			tmpval = local64_read(&group->hw.rc_count) + atomic64_read(&rr.value);
+			local64_set(&group->hw.rc_count, tmpval);
+			local64_set(&group->count, tmpval);
+		} else {
 			local64_set(&group->count, atomic64_read(&rr.value));
+		}
 
 		RC_DEBUG(("perf count after xchng parent, RMID:%d,pid:%d, count:%llu\n",
 			group->hw.cqm_rmid, group->hw.target->pid,__perf_event_count(group)));
 
 		list_for_each_entry(event, head, hw.cqm_group_entry) {
 			if (event->hw.is_group_event) {
-				rr = (struct rmid_read) {
-					.rmid = old_rmid,
-					.evt_type = event->attr.config,
-					.value = ATOMIC64_INIT(0),
-					};
+				event->hw.rmid_rc = true;
+				evttype = event->attr.config;
+				rr = __init_rr(old_rmid, evttype, 0);
 
 				cqm_mask_call(&rr);
-				if (is_mbm_event(event->attr.config))
-					local64_add(atomic64_read(&rr.value),
-						    &event->count);
-				else
+				if (is_mbm_event(event->attr.config)) {
+					tmpval = local64_read(&event->hw.rc_count) + atomic64_read(&rr.value);
+					local64_set(&event->hw.rc_count, tmpval);
+					local64_set(&event->count, tmpval);
+				} else {
 					local64_set(&event->count,
 						    atomic64_read(&rr.value));
-
-
+				}
 				RC_DEBUG(("perf count after xchng child, RMID:%d,pid:%d, count:%llu\n",
 					event->hw.cqm_rmid, event->hw.target->pid,__perf_event_count(event)));
 			}
@@ -633,18 +555,18 @@ static void intel_cqm_alloc_rmid(u32 rmid)
 		if (__rmid_valid(event->hw.cqm_rmid))
 			continue;
 
-		if (__conflict_event(event, leader))
-			continue;
-
 		ra.alloc_count++;
 		intel_cqm_xchg_rmid(event, rmid);
 
 		RC_DEBUG(("limbo --> alloc event_xchng done : PID: %d, event RMID: %d,rmid : %d\n",
 		event->hw.target->pid, event->hw.cqm_rmid, rmid));
-		print_ra();
+
 
 		return;
 	}
+
+	print_ra();
+
 
 	return;
 }
@@ -917,9 +839,9 @@ static void __intel_cqm_rmid_rotate(void)
 	if (!limbo_limit)
 		limbo_limit = cqm_max_rmid;
 
-	if ((ra.limbo_failed < __rmid_lfail_threshold &&
-	     (nr_needed <= ra.limbo_count || ra.limbo_count >= half_needed)) ||
-	     (ra.limbo_count >= limbo_limit) || !nr_needed)
+	if (((ra.limbo_failed < __rmid_lfail_threshold) &&
+	     (half_needed <= ra.limbo_count)) ||
+	     (!nr_needed || (ra.limbo_count >= limbo_limit)))
 		goto stabilize;
 
 	/*
@@ -979,10 +901,60 @@ static void intel_cqm_rmid_rotate(struct work_struct *work)
 		schedule_delayed_work(&intel_cqm_rmid_work, delay);
 }
 
+static int aneeded_rmids(void)
+{
+	struct perf_event *group;
+	int needed = 0;
+
+	list_for_each_entry(group, &cache_groups, hw.cqm_groups_entry) {
+		if (!__rmid_valid(group->hw.cqm_rmid))
+			needed++;
+	}
+
+	return needed;
+}
+
+static bool rmid_leak(void)
+{
+	int curr_max = ra.free_count + ra.alloc_count + ra.limbo_count;
+
+	int actual_need = aneeded_rmids();
+	return (curr_max != cqm_max_rmid);
+}
+
+static void print_elist(void)
+{
+	struct perf_event *group;
+	struct perf_event *event;
+	struct list_head *head;
+
+
+	RC_DEBUG(("RMID LEAKED!! dumping full eventlist \n"));
+
+	list_for_each_entry(group, &cache_groups, hw.cqm_groups_entry) {
+
+		head = &group->hw.cqm_group_entry;
+
+		RC_DEBUG(("event group PID:%d, RMID:%d ",group->hw.target->pid, group->hw.cqm_rmid));
+
+		list_for_each_entry(event, head, hw.cqm_group_entry) {
+			RC_DEBUG(("event PID:%d, RMID:%d ",event->hw.target->pid, event->hw.cqm_rmid));
+		}
+
+		RC_DEBUG(("\n"));
+	}
+
+}
+
 static void print_ra(void)
 {
 	RC_DEBUG(("cqm: cqm_l3_scale:%u, __intel_cqm_threshold:%u, __intel_cqm_max_threshold:%u \n  recycle_rmids:%d, ra.free_count:%d,limbo:%d,limboa:%d,limbo_failed:%d,alloc:%d,event:%d,eventr:%d\n",
 		cqm_l3_scale, __intel_cqm_threshold, __intel_cqm_max_threshold, recycle_rmids, ra.free_count, ra.limbo_count, ra.limbo_acount, ra.limbo_failed, ra.alloc_count, ra.event_count, ra.event_rcount));
+
+	if (rmid_leak())
+		print_elist();
+
+
 }
 
 static u64 update_sample(unsigned int rmid, u32 evt_type, int first)
@@ -1040,11 +1012,7 @@ static void __intel_mbm_event_init(void *info)
 
 static void init_mbm_sample(u32 rmid, u32 evt_type)
 {
-	struct rmid_read rr = {
-		.rmid = rmid,
-		.evt_type = evt_type,
-		.value = ATOMIC64_INIT(0),
-	};
+	struct rmid_read rr = __init_rr(rmid, evt_type, 0);
 
 	/* on each socket, init sample */
 	on_each_cpu_mask(&cqm_cpumask, __intel_mbm_event_init, &rr, 1);
@@ -1059,10 +1027,11 @@ static void intel_cqm_setup_event(struct perf_event *event,
 				  struct perf_event **group)
 {
 	struct perf_event *iter;
-	bool conflict = false;
 	u32 rmid;
 
 	event->hw.is_group_event = false;
+	event->hw.rmid_rc = false;
+	local64_set(&event->hw.rc_count, 0UL);
 	list_for_each_entry(iter, &cache_groups, hw.cqm_groups_entry) {
 		rmid = iter->hw.cqm_rmid;
 
@@ -1070,24 +1039,12 @@ static void intel_cqm_setup_event(struct perf_event *event,
 			/* All tasks in a group share an RMID */
 			event->hw.cqm_rmid = rmid;
 			*group = iter;
-			if (is_mbm_event(event->attr.config) && __rmid_valid(rmid))
-				init_mbm_sample(rmid, event->attr.config);
 			return;
 		}
-
-		/*
-		 * We only care about conflicts for events that are
-		 * actually scheduled in (and hence have a valid RMID).
-		 */
-		if (__conflict_event(iter, event) && __rmid_valid(rmid))
-			conflict = true;
 	}
 
 	ra.event_rcount++;
-	if (conflict)
-		rmid = INVALID_RMID;
-	else
-		rmid = __get_rmid();
+	rmid = __get_rmid();
 
 	if (is_mbm_event(event->attr.config) && __rmid_valid(rmid))
 		init_mbm_sample(rmid, event->attr.config);
@@ -1239,10 +1196,8 @@ static void mbm_hrtimer_init(void)
 static u64 intel_cqm_event_count(struct perf_event *event)
 {
 	unsigned long flags;
-	struct rmid_read rr = {
-		.evt_type = event->attr.config,
-		.value = ATOMIC64_INIT(0),
-	};
+	struct rmid_read rr = __init_rr(-1, event->attr.config, 0);
+	u64 tmpval;
 
 	/*
 	 * We only need to worry about task events. System-wide events
@@ -1284,6 +1239,13 @@ static u64 intel_cqm_event_count(struct perf_event *event)
 	 * busying performing the IPI calls. It's therefore necessary to
 	 * check @event's RMID afterwards, and if it has changed,
 	 * discard the result of the read.
+	 *
+	 * For MBM events, note that we are reading the total bytes and not
+	 * a snapshot. Hence if the RMID was recycled for the duration
+	 * we are taking the count add the current bytes
+	 * to the ones we had when we recycled the RMID. If the event's RMID
+	 * was never recycled, the RMID already has the total bytes,
+	 * so just return that.
 	 */
 	rr.rmid = ACCESS_ONCE(event->hw.cqm_rmid);
 
@@ -1294,10 +1256,13 @@ static u64 intel_cqm_event_count(struct perf_event *event)
 
 	raw_spin_lock_irqsave(&cache_lock, flags);
 	if (event->hw.cqm_rmid == rr.rmid) {
-		if (is_mbm_event(event->attr.config))
-			local64_add(atomic64_read(&rr.value), &event->count);
-		else
+		if (is_mbm_event(event->attr.config) && event->hw.rmid_rc) {
+			tmpval = atomic64_read(&rr.value) + local64_read(&event->hw.rc_count);
+			local64_set(&event->count, tmpval);
+		}
+		else {
 			local64_set(&event->count, atomic64_read(&rr.value));
+		}
 	}
 	raw_spin_unlock_irqrestore(&cache_lock, flags);
 out:
@@ -1518,13 +1483,11 @@ EVENT_ATTR_STR(total_bytes, intel_cqm_total_bytes, "event=0x02");
 EVENT_ATTR_STR(total_bytes.per-pkg, intel_cqm_total_bytes_pkg, "1");
 EVENT_ATTR_STR(total_bytes.unit, intel_cqm_total_bytes_unit, "MB");
 EVENT_ATTR_STR(total_bytes.scale, intel_cqm_total_bytes_scale, "1e-6");
-EVENT_ATTR_STR(total_bytes.snapshot, intel_cqm_total_bytes_snapshot, "1");
 
 EVENT_ATTR_STR(local_bytes, intel_cqm_local_bytes, "event=0x03");
 EVENT_ATTR_STR(local_bytes.per-pkg, intel_cqm_local_bytes_pkg, "1");
 EVENT_ATTR_STR(local_bytes.unit, intel_cqm_local_bytes_unit, "MB");
 EVENT_ATTR_STR(local_bytes.scale, intel_cqm_local_bytes_scale, "1e-6");
-EVENT_ATTR_STR(local_bytes.snapshot, intel_cqm_local_bytes_snapshot, "1");
 
 static struct attribute *intel_cqm_events_attr[] = {
 	EVENT_PTR(intel_cqm_llc),
@@ -1544,8 +1507,6 @@ static struct attribute *intel_mbm_events_attr[] = {
 	EVENT_PTR(intel_cqm_local_bytes_unit),
 	EVENT_PTR(intel_cqm_total_bytes_scale),
 	EVENT_PTR(intel_cqm_local_bytes_scale),
-	EVENT_PTR(intel_cqm_total_bytes_snapshot),
-	EVENT_PTR(intel_cqm_local_bytes_snapshot),
 	NULL,
 };
 
@@ -1563,8 +1524,6 @@ static struct attribute *intel_cmt_mbm_events_attr[] = {
 	EVENT_PTR(intel_cqm_total_bytes_scale),
 	EVENT_PTR(intel_cqm_local_bytes_scale),
 	EVENT_PTR(intel_cqm_llc_snapshot),
-	EVENT_PTR(intel_cqm_total_bytes_snapshot),
-	EVENT_PTR(intel_cqm_local_bytes_snapshot),
 	NULL,
 };
 
@@ -1811,7 +1770,7 @@ static int __init intel_cqm_init(void)
 	}
 
 
-	cqm_max_rmid = 10;
+//	cqm_max_rmid = 10;
 
 
 	/*
