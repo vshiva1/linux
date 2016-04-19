@@ -158,14 +158,12 @@ static u32 intel_cqm_rotation_rmid;
 /*
  * Is @rmid valid for programming the hardware?
  *
- * rmid 0 is reserved by the hardware for all non-monitored tasks, which
- * means that we should never come across an rmid with that value.
- * Likewise, an rmid value of -1 is used to indicate "no rmid currently
+ * An rmid value of -1 is used to indicate "no rmid currently
  * assigned" and is used as part of the rotation code.
  */
 static inline bool __rmid_valid(u32 rmid)
 {
-	if (!rmid || rmid == INVALID_RMID)
+	if (rmid == INVALID_RMID)
 		return false;
 
 	return true;
@@ -351,7 +349,7 @@ static int intel_cqm_setup_rmid_cache(void)
 	list_del(&entry->list);
 
 	mutex_lock(&cache_mutex);
-	intel_cqm_rotation_rmid = __get_rmid();
+
 	ra.free_count = cqm_max_rmid;
 	mutex_unlock(&cache_mutex);
 
@@ -587,7 +585,11 @@ static bool intel_cqm_sched_in_event(u32 rmid)
  */
 #define RMID_DEFAULT_QUEUE_TIME 250	/* ms */
 
+#define RMID_LIMBO_FAILURE_THRESHOLD 10
+#define RMID_LIMBO_FAILURE_MAX 500
+
 static unsigned int __rmid_queue_time_ms = RMID_DEFAULT_QUEUE_TIME;
+static unsigned int __rmid_lfail_threshold = RMID_LIMBO_FAILURE_THRESHOLD;
 
 /*
  * intel_cqm_rmid_stabilize - move RMIDs from limbo to free list
@@ -697,7 +699,7 @@ static bool intel_cqm_rmid_stabilize(unsigned int *available)
  * Pick a victim group and move it to the tail of the group list.
  * @next: The first group without an RMID
  */
-static void __intel_cqm_pick_and_rotate(struct perf_event *next)
+static void __intel_cqm_pick_and_rotate(void)
 {
 	struct perf_event *rotor;
 	u32 rmid;
@@ -708,11 +710,10 @@ static void __intel_cqm_pick_and_rotate(struct perf_event *next)
 				 hw.cqm_groups_entry);
 
 	/*
-	 * The group at the front of the list should always have a valid
-	 * RMID. If it doesn't then no groups have RMIDs assigned and we
-	 * don't need to rotate the list.
+	 * There is nothing to rotate if everyone has
+	 * invalid RMIDs.
 	 */
-	if (next == rotor)
+	if (!__rmid_valid(rotor->hw.cqm_rmid))
 		return;
 
 	rmid = intel_cqm_xchg_rmid(rotor, INVALID_RMID);
@@ -721,36 +722,16 @@ static void __intel_cqm_pick_and_rotate(struct perf_event *next)
 	list_rotate_left(&cache_groups);
 }
 
-/*
- * Deallocate the RMIDs from any events that conflict with @event, and
- * place them on the back of the group list.
- */
-static void intel_cqm_sched_out_conflicting_events(struct perf_event *event)
+static u32 required_rmids(void)
 {
-	struct perf_event *group, *g;
-	u32 rmid;
+	if (WARN_ON(ra.event_rcount < ra.alloc_count))
+		return 0;
 
-	lockdep_assert_held(&cache_mutex);
-
-	list_for_each_entry_safe(group, g, &cache_groups, hw.cqm_groups_entry) {
-		if (group == event)
-			continue;
-
-		rmid = group->hw.cqm_rmid;
-
-		/*
-		 * Skip events that don't have a valid RMID.
-		 */
-		if (!__rmid_valid(rmid))
-			continue;
-
-		intel_cqm_xchg_rmid(group, INVALID_RMID);
-		__put_rmid(rmid);
-	}
+	return (ra.event_rcount - ra.alloc_count);
 }
 
 static struct pmu intel_cqm_pmu;
-static bool __intel_cqm_rmid_rotate(void);
+static void __intel_cqm_rmid_rotate(void);
 
 static void intel_cqm_rmid_rotate(struct work_struct *work)
 {
@@ -767,89 +748,79 @@ static void intel_cqm_rmid_rotate(struct work_struct *work)
  * Rotating RMIDs is complicated because the hardware doesn't give us
  * any clues.
  *
- * There's problems with the hardware interface; when you change the
- * task:RMID map cachelines retain their 'old' tags, giving a skewed
- * picture. In order to work around this, we must always keep one free
- * RMID - intel_cqm_rotation_rmid.
- *
  * Rotation works by taking away an RMID from a group (the old RMID),
  * and assigning the free RMID to another group (the new RMID). We must
  * then wait for the old RMID to not be used (no cachelines tagged).
  * This ensure that all cachelines are tagged with 'active' RMIDs. At
  * this point we can start reading values for the new RMID and treat the
  * old RMID as the free RMID for the next rotation.
- *
- * Return %true or %false depending on whether we did any rotating.
+ * Recycling is basically this taking away an RMID from group. At
+ * any time we allow only 1/4th max_rmids to be recycled.
  */
-static bool __intel_cqm_rmid_rotate(void)
+static void __intel_cqm_rmid_rotate(void)
 {
-	struct perf_event *group, *start = NULL;
 	unsigned int threshold_limit;
 	unsigned int nr_needed = 0;
 	unsigned int nr_available;
-	bool rotated = false;
-	unsigned int delay;
+	unsigned int half_needed;
+	unsigned int limbo_limit;
+	unsigned long delay;
 
 	mutex_lock(&cache_mutex);
 
-again:
 	/*
-	 * Fast path through this function if there are no groups and no
-	 * RMIDs that need cleaning.
+	 * Scenario 1: We skip recycling and stabilization.
+	 * Fast path through this function if there is nothing
+	 * in the limbo and (there are no events or no one needs
+	 * an RMID).
 	 */
-	if (list_empty(&cache_groups) && list_empty(&cqm_rmid_limbo_lru)) {
+	nr_needed = required_rmids();
+	if (!ra.limbo_count && !nr_needed) {
 		recycle_rmids = false;
 		goto out;
 	}
 
-	list_for_each_entry(group, &cache_groups, hw.cqm_groups_entry) {
-		if (!__rmid_valid(group->hw.cqm_rmid)) {
-			if (!start)
-				start = group;
-			nr_needed++;
-		}
-	}
-
+again:
 	/*
-	 * We have some event groups, but they all have RMIDs assigned
-	 * and no RMIDs need cleaning.
+	 * Scenario 2: We skip recycling
+	 * If # of stabilization failures < threshold, skip recycling if:
+	 * 1.If there are enough RMIDs in the limbo already.
+	 * 2.we already recycled as many as the nr_needed originally was.
+	  * In this case the rc_count would be >= 1/2 the nr_needed.
+	 *
+	 * If # of stabilization failures>= threshold skip recycling if:
+	 * 1.we are here only to process the limbo proactively, not
+	 *  because we need RMIDs.
+	 * 2.if the recycled count is >= 1/4th the total RMIDs.
 	 */
-	if (!nr_needed && list_empty(&cqm_rmid_limbo_lru))
-		goto out;
+	half_needed = nr_needed >> 1U;
+	if (!half_needed)
+		half_needed = nr_needed;
 
-	if (!nr_needed)
+	limbo_limit = cqm_max_rmid >> 2U;
+	if (!limbo_limit)
+		limbo_limit = cqm_max_rmid;
+
+	if (((ra.limbo_failed < __rmid_lfail_threshold) &&
+	     (half_needed <= ra.limbo_count)) ||
+	     (!nr_needed || (ra.limbo_count >= limbo_limit)))
 		goto stabilize;
 
 	/*
-	 * We have more event groups without RMIDs than available RMIDs,
-	 * or we have event groups that conflict with the ones currently
-	 * scheduled.
-	 *
-	 * We force deallocate the rmid of the group at the head of
-	 * cache_groups. The first event group without an RMID then gets
-	 * assigned intel_cqm_rotation_rmid. This ensures we always make
-	 * forward progress.
-	 *
-	 * Rotate the cache_groups list so the previous head is now the
-	 * tail.
+	 * Scenario 3: We do both recycling and stabilization
+	 * Try recycling some IDs.
+	 * We recycle one RMID per recycling attempt so that the amount of
+	 * time the RMIDs stay without recycled is proportional to the max RMIDs
+	 * and the required number of IDs.
+	 * For ex: If there are 60 required IDs(event groups) and maxids is 50,
+	 * and we are recycling every 250ms,the time between two recycles
+	 * for an event is atleast 15s. However the time from when an event loses
+	 * an ID and gets a new ID could vary based on the occupancy , but note
+	 * that at the same time the cycling slows down which means the other events
+	 * loose the ID later..
 	 */
-	__intel_cqm_pick_and_rotate(start);
 
-	/*
-	 * If the rotation is going to succeed, reduce the threshold so
-	 * that we don't needlessly reuse dirty RMIDs.
-	 */
-	if (__rmid_valid(intel_cqm_rotation_rmid)) {
-		intel_cqm_xchg_rmid(start, intel_cqm_rotation_rmid);
-		intel_cqm_rotation_rmid = __get_rmid();
-
-		intel_cqm_sched_out_conflicting_events(start);
-
-		if (__intel_cqm_threshold)
-			__intel_cqm_threshold--;
-	}
-
-	rotated = true;
+	__intel_cqm_pick_and_rotate();
 
 stabilize:
 	/*
@@ -912,7 +883,6 @@ out:
 		schedule_delayed_work(&intel_cqm_rmid_work, delay);
 
 	mutex_unlock(&cache_mutex);
-	return rotated;
 }
 
 static u64 update_sample(unsigned int rmid, u32 evt_type, int first)
