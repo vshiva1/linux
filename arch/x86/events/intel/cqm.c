@@ -27,6 +27,31 @@
  */
 #define MBM_CTR_OVERFLOW_TIME	1000
 
+/**
+ * struct rmid_accounting- For profiling rmid recycling usage.
+ * @free_count:	rmids that are free
+ * @limbo_count:	rmids in limbo
+ * @limbo_acount:	rmids in limbo and did min wait
+ * @limbo_failed:	# of times we failed to stabilize and rmids in limbo
+ * @alloc_count:	rmids that are allocated to events
+ * @cqm_count:	number of cqm events
+ * @event_count:	total number of events
+ * @event_rcount:	rmids required by events taking the grouping
+ *  into account.
+ */
+struct rmid_accounting
+{
+	int free_count;
+	int limbo_count;
+	int limbo_acount;
+	int limbo_failed;
+	int alloc_count;
+	int cqm_count;
+	int event_count;
+	int event_rcount;
+};
+
+static struct rmid_accounting ra;
 static bool recycle_rmids;
 static u32 cqm_max_rmid = -1;
 static unsigned int cqm_l3_scale; /* supposedly cacheline size */
@@ -253,6 +278,8 @@ static u32 __get_rmid(void)
 
 	entry = list_first_entry(&cqm_rmid_free_lru, struct cqm_rmid_entry, list);
 	list_del(&entry->list);
+	ra.free_count--;
+	ra.alloc_count++;
 
 	return entry->rmid;
 }
@@ -271,6 +298,8 @@ static void __put_rmid(u32 rmid)
 
 	list_add_tail(&entry->list, &cqm_rmid_limbo_lru);
 	check_rotation();
+	ra.limbo_count++;
+	ra.alloc_count--;
 }
 
 static void cqm_cleanup(void)
@@ -323,6 +352,7 @@ static int intel_cqm_setup_rmid_cache(void)
 
 	mutex_lock(&cache_mutex);
 	intel_cqm_rotation_rmid = __get_rmid();
+	ra.free_count = cqm_max_rmid;
 	mutex_unlock(&cache_mutex);
 
 	return 0;
@@ -539,6 +569,7 @@ static bool intel_cqm_sched_in_event(u32 rmid)
 		if (__rmid_valid(event->hw.cqm_rmid))
 			continue;
 
+		ra.alloc_count++;
 		intel_cqm_xchg_rmid(event, rmid);
 		return true;
 	}
@@ -633,7 +664,7 @@ static bool intel_cqm_rmid_stabilize(unsigned int *available)
 			continue;
 
 		list_del(&entry->list);	/* remove from limbo */
-
+		ra.limbo_count--;
 		/*
 		 * The rotation RMID gets priority if it's
 		 * currently invalid. In which case, skip adding
@@ -655,6 +686,7 @@ static bool intel_cqm_rmid_stabilize(unsigned int *available)
 		 * Otherwise place it onto the free list.
 		 */
 		list_add_tail(&entry->list, &cqm_rmid_free_lru);
+		ra.free_count++;
 	}
 
 
@@ -687,6 +719,42 @@ static void __intel_cqm_pick_and_rotate(struct perf_event *next)
 	__put_rmid(rmid);
 
 	list_rotate_left(&cache_groups);
+}
+
+/*
+ * Deallocate the RMIDs from any events that conflict with @event, and
+ * place them on the back of the group list.
+ */
+static void intel_cqm_sched_out_conflicting_events(struct perf_event *event)
+{
+	struct perf_event *group, *g;
+	u32 rmid;
+
+	lockdep_assert_held(&cache_mutex);
+
+	list_for_each_entry_safe(group, g, &cache_groups, hw.cqm_groups_entry) {
+		if (group == event)
+			continue;
+
+		rmid = group->hw.cqm_rmid;
+
+		/*
+		 * Skip events that don't have a valid RMID.
+		 */
+		if (!__rmid_valid(rmid))
+			continue;
+
+		intel_cqm_xchg_rmid(group, INVALID_RMID);
+		__put_rmid(rmid);
+	}
+}
+
+static struct pmu intel_cqm_pmu;
+static bool __intel_cqm_rmid_rotate(void);
+
+static void intel_cqm_rmid_rotate(struct work_struct *work)
+{
+	__intel_cqm_rmid_rotate();
 }
 
 /*
@@ -774,6 +842,8 @@ again:
 	if (__rmid_valid(intel_cqm_rotation_rmid)) {
 		intel_cqm_xchg_rmid(start, intel_cqm_rotation_rmid);
 		intel_cqm_rotation_rmid = __get_rmid();
+
+		intel_cqm_sched_out_conflicting_events(start);
 
 		if (__intel_cqm_threshold)
 			__intel_cqm_threshold--;
@@ -985,6 +1055,7 @@ static void intel_cqm_setup_event(struct perf_event *event,
 
 	}
 
+	ra.event_rcount++;
 	rmid = __get_rmid();
 
 	if (is_mbm_event(event->attr.config) && __rmid_valid(rmid))
@@ -1275,6 +1346,9 @@ static void intel_cqm_event_destroy(struct perf_event *event)
 	unsigned long flags;
 
 	mutex_lock(&cache_mutex);
+	if (!is_mbm_event(event->attr.config))
+		ra.cqm_count--;
+	ra.event_count--;
 	/*
 	* Hold the cache_lock as mbm timer handlers could be
 	* scanning the list of events.
@@ -1308,6 +1382,7 @@ static void intel_cqm_event_destroy(struct perf_event *event)
 			if (__rmid_valid(rmid))
 				__put_rmid(rmid);
 			list_del(&event->hw.cqm_groups_entry);
+			ra.event_rcount--;
 		}
 	}
 
@@ -1361,6 +1436,10 @@ static int intel_cqm_event_init(struct perf_event *event)
 
 	/* Will also set rmid */
 	intel_cqm_setup_event(event, &group);
+
+	if (!is_mbm_event(event->attr.config))
+		ra.cqm_count++;
+	ra.event_count++;
 
 	/*
 	* Hold the cache_lock as mbm timer handlers be
