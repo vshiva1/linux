@@ -27,6 +27,7 @@
  */
 #define MBM_CTR_OVERFLOW_TIME	1000
 
+static bool recycle_rmids;
 static u32 cqm_max_rmid = -1;
 static unsigned int cqm_l3_scale; /* supposedly cacheline size */
 static bool cqm_enabled, mbm_enabled;
@@ -215,6 +216,17 @@ static LIST_HEAD(cqm_rmid_limbo_lru);
  */
 static struct cqm_rmid_entry **cqm_rmid_ptrs;
 
+static void intel_cqm_rmid_rotate(struct work_struct *work);
+static DECLARE_DELAYED_WORK(intel_cqm_rmid_work, intel_cqm_rmid_rotate);
+
+static inline void check_rotation(void)
+{
+	if (!recycle_rmids) {
+		schedule_delayed_work(&intel_cqm_rmid_work, 0);
+		recycle_rmids = true;
+	}
+}
+
 static inline struct cqm_rmid_entry *__rmid_entry(u32 rmid)
 {
 	struct cqm_rmid_entry *entry;
@@ -258,6 +270,7 @@ static void __put_rmid(u32 rmid)
 	entry->state = RMID_YOUNG;
 
 	list_add_tail(&entry->list, &cqm_rmid_limbo_lru);
+	check_rotation();
 }
 
 static void cqm_cleanup(void)
@@ -707,6 +720,7 @@ static bool __intel_cqm_rmid_rotate(void)
 	unsigned int nr_needed = 0;
 	unsigned int nr_available;
 	bool rotated = false;
+	unsigned int delay;
 
 	mutex_lock(&cache_mutex);
 
@@ -715,8 +729,10 @@ again:
 	 * Fast path through this function if there are no groups and no
 	 * RMIDs that need cleaning.
 	 */
-	if (list_empty(&cache_groups) && list_empty(&cqm_rmid_limbo_lru))
+	if (list_empty(&cache_groups) && list_empty(&cqm_rmid_limbo_lru)) {
+		recycle_rmids = false;
 		goto out;
+	}
 
 	list_for_each_entry(group, &cache_groups, hw.cqm_groups_entry) {
 		if (!__rmid_valid(group->hw.cqm_rmid)) {
@@ -820,24 +836,13 @@ stabilize:
 	}
 
 out:
+	delay = msecs_to_jiffies(intel_cqm_pmu.hrtimer_interval_ms);
+
+	if (recycle_rmids)
+		schedule_delayed_work(&intel_cqm_rmid_work, delay);
+
 	mutex_unlock(&cache_mutex);
 	return rotated;
-}
-
-static void intel_cqm_rmid_rotate(struct work_struct *work);
-
-static DECLARE_DELAYED_WORK(intel_cqm_rmid_work, intel_cqm_rmid_rotate);
-
-static struct pmu intel_cqm_pmu;
-
-static void intel_cqm_rmid_rotate(struct work_struct *work)
-{
-	unsigned long delay;
-
-	__intel_cqm_rmid_rotate();
-
-	delay = msecs_to_jiffies(intel_cqm_pmu.hrtimer_interval_ms);
-	schedule_delayed_work(&intel_cqm_rmid_work, delay);
 }
 
 static u64 update_sample(unsigned int rmid, u32 evt_type, int first)
@@ -1382,10 +1387,11 @@ static int intel_cqm_event_init(struct perf_event *event)
 	}
 
 	raw_spin_unlock_irqrestore(&cache_lock, flags);
-	mutex_unlock(&cache_mutex);
 
 	if (rotate)
-		schedule_delayed_work(&intel_cqm_rmid_work, 0);
+		check_rotation();
+
+	mutex_unlock(&cache_mutex);
 
 	return 0;
 }
