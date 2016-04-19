@@ -14,6 +14,14 @@
 #define MSR_IA32_QM_EVTSEL	0x0c8d
 
 #define MBM_CNTR_WIDTH		24
+
+#define __init_rr(old_rmid, config, val) 		\
+			(struct rmid_read) {		\
+			.rmid = old_rmid,		\
+			.evt_type = config,		\
+			.value = ATOMIC64_INIT(val),	\
+			}
+
 /*
  * Guaranteed time in ms as per SDM where MBM counters will not overflow.
  */
@@ -471,6 +479,19 @@ static void cqm_mask_call(struct rmid_read *rr)
 		on_each_cpu_mask(&cqm_cpumask, __intel_cqm_event_count, rr, 1);
 }
 
+static inline void mbm_set_rccount(
+			  struct perf_event *event, struct rmid_read *rr)
+{
+	u64 tmpval;
+
+	tmpval = local64_read(&event->hw.rc_count) + atomic64_read(&rr->value) -
+		 local64_read(&event->hw.st_count);
+
+	local64_set(&event->hw.rc_count, tmpval);
+	local64_set(&event->hw.st_count, 0UL);
+	local64_set(&event->count, tmpval);
+}
+
 /*
  * Exchange the RMID of a group of events.
  */
@@ -478,22 +499,40 @@ static u32 intel_cqm_xchg_rmid(struct perf_event *group, u32 rmid)
 {
 	struct perf_event *event;
 	struct list_head *head = &group->hw.cqm_group_entry;
-	u32 old_rmid = group->hw.cqm_rmid;
+	u32 old_rmid = group->hw.cqm_rmid, evttype;
+	struct rmid_read rr;
 
 	lockdep_assert_held(&cache_mutex);
 
 	/*
 	 * If our RMID is being deallocated, perform a read now.
+	 * For mbm note that we need to store the bytes that were counted till now.
+	 * Hence store the difference of current count and start count.
 	 */
 	if (__rmid_valid(old_rmid) && !__rmid_valid(rmid)) {
-		struct rmid_read rr = {
-			.rmid = old_rmid,
-			.evt_type = group->attr.config,
-			.value = ATOMIC64_INIT(0),
-		};
 
+		rr = __init_rr(old_rmid, group->attr.config, 0);
 		cqm_mask_call(&rr);
-		local64_set(&group->count, atomic64_read(&rr.value));
+
+		if (is_mbm_event(group->attr.config))
+			mbm_set_rccount(group, &rr);
+		else
+			local64_set(&group->count, atomic64_read(&rr.value));
+
+		list_for_each_entry(event, head, hw.cqm_group_entry) {
+			if (event->hw.is_group_event) {
+
+				evttype = event->attr.config;
+				rr = __init_rr(old_rmid, evttype, 0);
+
+				cqm_mask_call(&rr);
+				if (is_mbm_event(event->attr.config))
+					mbm_set_rccount(event, &rr);
+				else
+					local64_set(&event->count,
+						    atomic64_read(&rr.value));
+			}
+		}
 	}
 
 	raw_spin_lock_irq(&cache_lock);
@@ -983,14 +1022,62 @@ static void __intel_mbm_event_init(void *info)
 
 static void init_mbm_sample(u32 rmid, u32 evt_type)
 {
-	struct rmid_read rr = {
-		.rmid = rmid,
-		.evt_type = evt_type,
-		.value = ATOMIC64_INIT(0),
-	};
+	struct rmid_read rr = __init_rr(rmid, evt_type, 0);
 
 	/* on each socket, init sample */
 	on_each_cpu_mask(&cqm_cpumask, __intel_mbm_event_init, &rr, 1);
+}
+
+static inline bool first_event_ingroup(struct perf_event *group,
+				    struct perf_event *event)
+{
+	struct list_head *head = &group->hw.cqm_group_entry;
+	u32 evt_type = event->attr.config;
+
+	if (evt_type == group->attr.config)
+		return false;
+	list_for_each_entry(event, head, hw.cqm_group_entry) {
+		if (evt_type == event->attr.config)
+			return false;
+	}
+
+	return true;
+}
+
+/*
+ * mbm_setup_event - Does mbm specific count initialization
+ * when multiple events share RMID.
+ *
+ * If this is the first mbm event using the RMID, then initialize
+ * the total_bytes in the RMID and prev_count.
+ * else only initialize the start count of the event which is the current
+ * count of the RMID.
+ * In other words if the RMID has say counted 100MB till now because
+ * other event was already using it, we start
+ * from zero for our new event. Because after 1s if user checks the count,
+ * we need to report for the 1s duration and not the entire duration the
+ * RMID was being counted.
+*/
+static inline void mbm_setup_event(u32 rmid, struct perf_event *group,
+					  struct perf_event *event)
+{
+	u32 evt_type = event->attr.config;
+	struct rmid_read rr;
+
+	if (first_event_ingroup(group, event)) {
+		init_mbm_sample(rmid, evt_type);
+	} else {
+		rr = __init_rr(rmid, evt_type, 0);
+		cqm_mask_call(&rr);
+		local64_set(&event->hw.st_count, atomic64_read(&rr.value));
+	}
+}
+
+static inline void mbm_setup_event_init(struct perf_event *event)
+{
+	event->hw.is_group_event = false;
+	local64_set(&event->hw.rc_count, 0UL);
+	local64_set(&event->hw.st_count, 0UL);
 }
 
 /*
@@ -1005,7 +1092,7 @@ static void intel_cqm_setup_event(struct perf_event *event,
 	bool conflict = false;
 	u32 rmid;
 
-	event->hw.is_group_event = false;
+	mbm_setup_event_init(event);
 	list_for_each_entry(iter, &cache_groups, hw.cqm_groups_entry) {
 		rmid = iter->hw.cqm_rmid;
 
@@ -1014,7 +1101,7 @@ static void intel_cqm_setup_event(struct perf_event *event,
 			event->hw.cqm_rmid = rmid;
 			*group = iter;
 			if (is_mbm_event(event->attr.config) && __rmid_valid(rmid))
-				init_mbm_sample(rmid, event->attr.config);
+				mbm_setup_event(rmid, iter, event);
 			return;
 		}
 
@@ -1181,10 +1268,8 @@ static void mbm_hrtimer_init(void)
 static u64 intel_cqm_event_count(struct perf_event *event)
 {
 	unsigned long flags;
-	struct rmid_read rr = {
-		.evt_type = event->attr.config,
-		.value = ATOMIC64_INIT(0),
-	};
+	struct rmid_read rr = __init_rr(-1, event->attr.config, 0);
+	u64 tmpval;
 
 	/*
 	 * We only need to worry about task events. System-wide events
@@ -1226,6 +1311,11 @@ static u64 intel_cqm_event_count(struct perf_event *event)
 	 * busying performing the IPI calls. It's therefore necessary to
 	 * check @event's RMID afterwards, and if it has changed,
 	 * discard the result of the read.
+	 *
+	 * For MBM events, note that we are reading the total bytes and not
+	 * a snapshot. Hence if the RMID was recycled for the duration
+	 * we will be adding the rc_count which keeps the historical count
+	 * of old RMIDs that were used.
 	 */
 	rr.rmid = ACCESS_ONCE(event->hw.cqm_rmid);
 
@@ -1235,8 +1325,18 @@ static u64 intel_cqm_event_count(struct perf_event *event)
 	cqm_mask_call(&rr);
 
 	raw_spin_lock_irqsave(&cache_lock, flags);
-	if (event->hw.cqm_rmid == rr.rmid)
-		local64_set(&event->count, atomic64_read(&rr.value));
+	if (event->hw.cqm_rmid == rr.rmid) {
+		if (is_mbm_event(event->attr.config)) {
+			tmpval = atomic64_read(&rr.value) +
+				local64_read(&event->hw.rc_count) -
+				local64_read(&event->hw.st_count);
+
+			local64_set(&event->count, tmpval);
+		}
+		else {
+			local64_set(&event->count, atomic64_read(&rr.value));
+		}
+	}
 	raw_spin_unlock_irqrestore(&cache_lock, flags);
 out:
 	return __perf_event_count(event);
