@@ -3,6 +3,7 @@
  *
  * Based very, very heavily on work by Peter Zijlstra.
  */
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/perf_event.h>
 #include <linux/slab.h>
@@ -14,6 +15,8 @@
 #define MSR_IA32_QM_EVTSEL	0x0c8d
 
 #define MBM_CNTR_WIDTH		24
+
+#define RC_DEBUG(x) pr_info x
 
 #define __init_rr(old_rmid, config, val) 		\
 			(struct rmid_read) {		\
@@ -229,6 +232,8 @@ static LIST_HEAD(cqm_rmid_limbo_lru);
  * times.
  */
 static struct cqm_rmid_entry **cqm_rmid_ptrs;
+
+static void print_ra(void);
 
 static void intel_cqm_rmid_rotate(struct work_struct *work);
 static DECLARE_DELAYED_WORK(intel_cqm_rmid_work, intel_cqm_rmid_rotate);
@@ -465,6 +470,9 @@ static u32 intel_cqm_xchg_rmid(struct perf_event *group, u32 rmid)
 		else
 			local64_set(&group->count, atomic64_read(&rr.value));
 
+		RC_DEBUG(("alloc-->limbo perf count after xchng parent, RMID:%d,pid:%d, count:%llu\n",
+			group->hw.cqm_rmid, group->hw.target->pid,__perf_event_count(group)));
+
 		list_for_each_entry(event, head, hw.cqm_group_entry) {
 			if (event->hw.is_group_event) {
 
@@ -477,6 +485,9 @@ static u32 intel_cqm_xchg_rmid(struct perf_event *group, u32 rmid)
 				else
 					local64_set(&event->count,
 						    atomic64_read(&rr.value));
+
+				RC_DEBUG(("alloc-->limbo perf count after xchng child, RMID:%d,pid:%d, count:%llu\n",
+					event->hw.cqm_rmid, event->hw.target->pid,__perf_event_count(event)));
 			}
 		}
 	}
@@ -560,8 +571,16 @@ static void intel_cqm_alloc_rmid(u32 rmid)
 
 		ra.alloc_count++;
 		intel_cqm_xchg_rmid(event, rmid);
+
+		RC_DEBUG(("limbo --> alloc event_xchng done : PID: %d, event RMID: %d,rmid : %d\n",
+		event->hw.target->pid, event->hw.cqm_rmid, rmid));
+
+
 		return;
 	}
+
+	print_ra();
+
 
 	return;
 }
@@ -709,6 +728,9 @@ __stabilize:
 		 */
 		list_add_tail(&entry->list, &cqm_rmid_free_lru);
 		ra.free_count++;
+
+		RC_DEBUG(("limbo --> free: RMID:%d\n",entry->rmid));
+		print_ra();
 	}
 
 	/*
@@ -884,6 +906,49 @@ out:
 		schedule_delayed_work(&intel_cqm_rmid_work, delay);
 
 	mutex_unlock(&cache_mutex);
+}
+
+
+static bool rmid_leak(void)
+{
+	int curr_max = ra.free_count + ra.alloc_count + ra.limbo_count;
+
+	return (curr_max != cqm_max_rmid);
+}
+
+static void print_elist(void)
+{
+	struct perf_event *group;
+	struct perf_event *event;
+	struct list_head *head;
+
+
+	RC_DEBUG(("RMID LEAKED!! dumping full eventlist \n"));
+
+	list_for_each_entry(group, &cache_groups, hw.cqm_groups_entry) {
+
+		head = &group->hw.cqm_group_entry;
+
+		RC_DEBUG(("event group PID:%d, RMID:%d ",group->hw.target->pid, group->hw.cqm_rmid));
+
+		list_for_each_entry(event, head, hw.cqm_group_entry) {
+			RC_DEBUG(("event PID:%d, RMID:%d ",event->hw.target->pid, event->hw.cqm_rmid));
+		}
+
+		RC_DEBUG(("\n"));
+	}
+
+}
+
+static void print_ra(void)
+{
+	RC_DEBUG(("cqm: cqm_l3_scale:%u, __intel_cqm_threshold:%u, __intel_cqm_max_threshold:%u \n  recycle_rmids:%d, ra.free_count:%d,limbo:%d,limboa:%d,limbo_failed:%d,alloc:%d,event:%d,eventr:%d\n",
+		cqm_l3_scale, __intel_cqm_threshold, __intel_cqm_max_threshold, recycle_rmids, ra.free_count, ra.limbo_count, ra.limbo_acount, ra.limbo_failed, ra.alloc_count, ra.event_count, ra.event_rcount));
+
+	if (rmid_leak())
+		print_elist();
+
+
 }
 
 static u64 update_sample(unsigned int rmid, u32 evt_type, int first)
@@ -1316,6 +1381,9 @@ static void intel_cqm_event_destroy(struct perf_event *event)
 	unsigned long flags;
 
 	mutex_lock(&cache_mutex);
+
+	RC_DEBUG(("event_destroy : PID: %d, RMID: %d\n", event->hw.target->pid, event->hw.cqm_rmid));
+
 	if (!is_mbm_event(event->attr.config))
 		ra.cqm_count--;
 	ra.event_count--;
@@ -1363,6 +1431,8 @@ static void intel_cqm_event_destroy(struct perf_event *event)
 	*/
 	if (mbm_enabled && list_empty(&cache_groups))
 		mbm_stop_timers();
+
+	print_ra();
 
 	mutex_unlock(&cache_mutex);
 }
@@ -1436,6 +1506,9 @@ static int intel_cqm_event_init(struct perf_event *event)
 	}
 
 	raw_spin_unlock_irqrestore(&cache_lock, flags);
+
+	RC_DEBUG(("event_init : PID: %d, RMID: %d\n", event->hw.target->pid, event->hw.cqm_rmid));
+	print_ra();
 
 	if (rotate)
 		check_rotation();
@@ -1740,6 +1813,10 @@ static int __init intel_cqm_init(void)
 			goto out;
 		}
 	}
+
+
+//	cqm_max_rmid = 10;
+
 
 	/*
 	 * A reasonable upper limit on the max threshold is the number
