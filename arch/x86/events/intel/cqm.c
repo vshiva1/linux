@@ -370,92 +370,6 @@ static inline struct perf_cgroup *event_to_cgroup(struct perf_event *event)
 }
 #endif
 
-/*
- * Determine if @a's tasks intersect with @b's tasks
- *
- * There are combinations of events that we explicitly prohibit,
- *
- *		   PROHIBITS
- *     system-wide    -> 	cgroup and task
- *     cgroup 	      ->	system-wide
- *     		      ->	task in cgroup
- *     task 	      -> 	system-wide
- *     		      ->	task in cgroup
- *
- * Call this function before allocating an RMID.
- */
-static bool __conflict_event(struct perf_event *a, struct perf_event *b)
-{
-#ifdef CONFIG_CGROUP_PERF
-	/*
-	 * We can have any number of cgroups but only one system-wide
-	 * event at a time.
-	 */
-	if (a->cgrp && b->cgrp) {
-		struct perf_cgroup *ac = a->cgrp;
-		struct perf_cgroup *bc = b->cgrp;
-
-		/*
-		 * This condition should have been caught in
-		 * __match_event() and we should be sharing an RMID.
-		 */
-		WARN_ON_ONCE(ac == bc);
-
-		if (cgroup_is_descendant(ac->css.cgroup, bc->css.cgroup) ||
-		    cgroup_is_descendant(bc->css.cgroup, ac->css.cgroup))
-			return true;
-
-		return false;
-	}
-
-	if (a->cgrp || b->cgrp) {
-		struct perf_cgroup *ac, *bc;
-
-		/*
-		 * cgroup and system-wide events are mutually exclusive
-		 */
-		if ((a->cgrp && !(b->attach_state & PERF_ATTACH_TASK)) ||
-		    (b->cgrp && !(a->attach_state & PERF_ATTACH_TASK)))
-			return true;
-
-		/*
-		 * Ensure neither event is part of the other's cgroup
-		 */
-		ac = event_to_cgroup(a);
-		bc = event_to_cgroup(b);
-		if (ac == bc)
-			return true;
-
-		/*
-		 * Must have cgroup and non-intersecting task events.
-		 */
-		if (!ac || !bc)
-			return false;
-
-		/*
-		 * We have cgroup and task events, and the task belongs
-		 * to a cgroup. Check for for overlap.
-		 */
-		if (cgroup_is_descendant(ac->css.cgroup, bc->css.cgroup) ||
-		    cgroup_is_descendant(bc->css.cgroup, ac->css.cgroup))
-			return true;
-
-		return false;
-	}
-#endif
-	/*
-	 * If one of them is not a task, same story as above with cgroups.
-	 */
-	if (!(a->attach_state & PERF_ATTACH_TASK) ||
-	    !(b->attach_state & PERF_ATTACH_TASK))
-		return true;
-
-	/*
-	 * Must be non-overlapping.
-	 */
-	return false;
-}
-
 struct rmid_read {
 	u32 rmid;
 	u32 evt_type;
@@ -595,8 +509,7 @@ static void intel_cqm_stable(void *arg)
 }
 
 /*
- * If we have group events waiting for an RMID that don't conflict with
- * events already running, assign @rmid.
+ * If we have group events waiting for an RMID assign @rmid.
  */
 static bool intel_cqm_sched_in_event(u32 rmid)
 {
@@ -611,9 +524,6 @@ static bool intel_cqm_sched_in_event(u32 rmid)
 	list_for_each_entry_continue(event, &cache_groups,
 				     hw.cqm_groups_entry) {
 		if (__rmid_valid(event->hw.cqm_rmid))
-			continue;
-
-		if (__conflict_event(event, leader))
 			continue;
 
 		intel_cqm_xchg_rmid(event, rmid);
@@ -767,40 +677,6 @@ static void __intel_cqm_pick_and_rotate(struct perf_event *next)
 }
 
 /*
- * Deallocate the RMIDs from any events that conflict with @event, and
- * place them on the back of the group list.
- */
-static void intel_cqm_sched_out_conflicting_events(struct perf_event *event)
-{
-	struct perf_event *group, *g;
-	u32 rmid;
-
-	lockdep_assert_held(&cache_mutex);
-
-	list_for_each_entry_safe(group, g, &cache_groups, hw.cqm_groups_entry) {
-		if (group == event)
-			continue;
-
-		rmid = group->hw.cqm_rmid;
-
-		/*
-		 * Skip events that don't have a valid RMID.
-		 */
-		if (!__rmid_valid(rmid))
-			continue;
-
-		/*
-		 * No conflict? No problem! Leave the event alone.
-		 */
-		if (!__conflict_event(group, event))
-			continue;
-
-		intel_cqm_xchg_rmid(group, INVALID_RMID);
-		__put_rmid(rmid);
-	}
-}
-
-/*
  * Attempt to rotate the groups and assign new RMIDs.
  *
  * We rotate for two reasons,
@@ -882,8 +758,6 @@ again:
 	if (__rmid_valid(intel_cqm_rotation_rmid)) {
 		intel_cqm_xchg_rmid(start, intel_cqm_rotation_rmid);
 		intel_cqm_rotation_rmid = __get_rmid();
-
-		intel_cqm_sched_out_conflicting_events(start);
 
 		if (__intel_cqm_threshold)
 			__intel_cqm_threshold--;
@@ -1089,7 +963,6 @@ static void intel_cqm_setup_event(struct perf_event *event,
 				  struct perf_event **group)
 {
 	struct perf_event *iter;
-	bool conflict = false;
 	u32 rmid;
 
 	mbm_setup_event_init(event);
@@ -1105,18 +978,9 @@ static void intel_cqm_setup_event(struct perf_event *event,
 			return;
 		}
 
-		/*
-		 * We only care about conflicts for events that are
-		 * actually scheduled in (and hence have a valid RMID).
-		 */
-		if (__conflict_event(iter, event) && __rmid_valid(rmid))
-			conflict = true;
 	}
 
-	if (conflict)
-		rmid = INVALID_RMID;
-	else
-		rmid = __get_rmid();
+	rmid = __get_rmid();
 
 	if (is_mbm_event(event->attr.config) && __rmid_valid(rmid))
 		init_mbm_sample(rmid, event->attr.config);
@@ -1473,7 +1337,8 @@ static int intel_cqm_event_init(struct perf_event *event)
 	    event->attr.exclude_idle   ||
 	    event->attr.exclude_host   ||
 	    event->attr.exclude_guest  ||
-	    event->attr.sample_period) /* no sampling */
+	    event->attr.sample_period  || /* no sampling */
+	    !(event->attach_state & PERF_ATTACH_TASK))
 		return -EINVAL;
 
 	INIT_LIST_HEAD(&event->hw.cqm_group_entry);
