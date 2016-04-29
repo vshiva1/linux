@@ -10558,5 +10558,7 @@ struct cgroup_subsys perf_event_cgrp_subsys = {
 	.css_released	= perf_cgroup_css_released,
 	.css_free	= perf_cgroup_css_free,
 	.attach		= perf_cgroup_attach,
+	/* Expand architecture specific attributes. */
+	PERF_CGROUP_ARCH_CGRP_SUBSYS_ATTS
 };
 #endif /* CONFIG_CGROUP_PERF */

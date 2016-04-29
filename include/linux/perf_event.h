@@ -1390,4 +1390,8 @@ static struct device_attribute format_attr_##_name = __ATTR_RO(_name)
 # define perf_cgroup_arch_css_free(css) do { } while (0)
 #endif
 
+#ifndef PERF_CGROUP_ARCH_CGRP_SUBSYS_ATTS
+#define PERF_CGROUP_ARCH_CGRP_SUBSYS_ATTS
+#endif
+
 #endif /* _LINUX_PERF_EVENT_H */
