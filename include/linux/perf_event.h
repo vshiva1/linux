@@ -672,8 +672,18 @@ struct perf_event {
 #endif
 
 	struct list_head		sb_list;
+
+	/* Flags to generic code set by PMU. */
+	int				pmu_event_flags;
+
 #endif /* CONFIG_PERF_EVENTS */
 };
+
+/*
+ * Flags for pmu_event_flags.
+ */
+/* Do not enable cgroup events in descendant cgroups. */
+#define PERF_CGROUP_NO_RECURSION	(1 << 0)
 
 /**
  * struct perf_event_context - event context structure

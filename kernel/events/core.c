@@ -554,6 +554,9 @@ perf_cgroup_match(struct perf_event *event)
 	if (!cpuctx->cgrp)
 		return false;
 
+	if (event->pmu_event_flags & PERF_CGROUP_NO_RECURSION)
+		return cpuctx->cgrp->css.cgroup == event->cgrp->css.cgroup;
+
 	/*
 	 * Cgroup scoping is recursive.  An event enabled for a cgroup is
 	 * also enabled for all its descendant cgroups.  If @cpuctx's
