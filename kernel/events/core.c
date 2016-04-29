@@ -3396,9 +3396,6 @@ unlock:
 
 static inline u64 perf_event_count(struct perf_event *event)
 {
-	if (event->pmu->count)
-		return event->pmu->count(event);
-
 	return __perf_event_count(event);
 }
 
@@ -3408,7 +3405,6 @@ static inline u64 perf_event_count(struct perf_event *event)
  *   - either for the current task, or for this CPU
  *   - does not have inherit set, for inherited task events
  *     will not be local and we cannot read them atomically
- *   - must not have a pmu::count method
  */
 u64 perf_event_read_local(struct perf_event *event)
 {
@@ -3434,12 +3430,6 @@ u64 perf_event_read_local(struct perf_event *event)
 	 * all child counters from atomic context.
 	 */
 	WARN_ON_ONCE(event->attr.inherit);
-
-	/*
-	 * It must not have a pmu::count method, those are not
-	 * NMI safe.
-	 */
-	WARN_ON_ONCE(event->pmu->count);
 
 	/*
 	 * If the event is currently on this CPU, its either a per-task event,

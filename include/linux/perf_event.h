@@ -118,14 +118,6 @@ struct hw_perf_event {
 			/* for tp_event->class */
 			struct list_head	tp_list;
 		};
-		struct { /* intel_cqm */
-			int			cqm_state;
-			u32			cqm_rmid;
-			int			is_group_event;
-			struct list_head	cqm_events_entry;
-			struct list_head	cqm_groups_entry;
-			struct list_head	cqm_group_entry;
-		};
 		struct { /* itrace */
 			int			itrace_started;
 		};
@@ -386,12 +378,6 @@ struct pmu {
 	 * PMU specific data size
 	 */
 	size_t				task_ctx_size;
-
-
-	/*
-	 * Return the count value for a counter.
-	 */
-	u64 (*count)			(struct perf_event *event); /*optional*/
 
 	/*
 	 * Set up pmu-private data structures for an AUX area
