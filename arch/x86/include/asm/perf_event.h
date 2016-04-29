@@ -299,4 +299,36 @@ static inline void perf_check_microcode(void) { }
 
 #define arch_perf_out_copy_user copy_from_user_nmi
 
+
+/*
+ * Hooks for architecture specific features of perf_event cgroup.
+ * Currently used by Intel's CQM.
+ */
+#ifdef CONFIG_CGROUP_PERF
+#ifdef CONFIG_INTEL_RDT
+
+#define perf_cgroup_arch_css_alloc \
+	perf_cgroup_arch_css_alloc
+int perf_cgroup_arch_css_alloc(struct cgroup_subsys_state *parent_css,
+				      struct cgroup_subsys_state *new_css);
+
+#define perf_cgroup_arch_css_online \
+	perf_cgroup_arch_css_online
+int perf_cgroup_arch_css_online(struct cgroup_subsys_state *css);
+
+#define perf_cgroup_arch_css_offline \
+	perf_cgroup_arch_css_offline
+void perf_cgroup_arch_css_offline(struct cgroup_subsys_state *css);
+
+#define perf_cgroup_arch_css_released \
+	perf_cgroup_arch_css_released
+void perf_cgroup_arch_css_released(struct cgroup_subsys_state *css);
+
+#define perf_cgroup_arch_css_free \
+	perf_cgroup_arch_css_free
+void perf_cgroup_arch_css_free(struct cgroup_subsys_state *css);
+
+#endif
+#endif
+
 #endif /* _ASM_X86_PERF_EVENT_H */

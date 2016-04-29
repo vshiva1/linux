@@ -316,6 +316,7 @@ struct pkg_data {
  * struct monr: MONitored Resource.
  * @flags:		Flags field for monr (XXX: More flags will be added
  *			with MBM).
+ * @mon_cgrp:		The cgroup associated with this monr, if any
  * @mon_event_group:	The head of event's group that use this monr, if any.
  * @parent:		Parent in monr hierarchy.
  * @children:		List of children in monr hierarchy.
@@ -336,6 +337,7 @@ struct pkg_data {
 struct monr {
 	u16				flags;
 	/* Back reference pointers */
+	struct perf_cgroup		*mon_cgrp;
 	struct perf_event		*mon_event_group;
 
 	struct monr			*parent;
@@ -514,3 +516,17 @@ static unsigned int __cqm_min_progress_rate = CQM_DEFAULT_MIN_PROGRESS_RATE;
  * It's units are bytes must be scaled by cqm_l3_scale to obtain cache lines.
  */
 static unsigned int __intel_cqm_max_threshold;
+
+#ifdef CONFIG_CGROUP_PERF
+
+struct cgrp_cqm_info {
+	/* Should the cgroup be continuously monitored? */
+	bool		cont_monitoring;
+	struct monr	*monr;
+};
+
+# define css_to_perf_cgroup(css_) container_of(css_, struct perf_cgroup, css)
+# define cgrp_to_cqm_info(cgrp_) ((struct cgrp_cqm_info *)cgrp_->arch_info)
+# define css_to_cqm_info(css_) cgrp_to_cqm_info(css_to_perf_cgroup(css_))
+
+#endif

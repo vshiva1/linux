@@ -89,6 +89,13 @@ struct monr *monr_hrchy_root;
 
 struct pkg_data **cqm_pkgs_data;
 
+/*
+ * Synchronizes initialization of cqm with cgroups.
+ */
+static DEFINE_MUTEX(cqm_init_mutex);
+
+DEFINE_STATIC_KEY_FALSE(cqm_initialized_key);
+
 static inline bool __pmonr__in_astate(struct pmonr *pmonr)
 {
 	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
@@ -119,6 +126,9 @@ static inline bool __pmonr__in_instate(struct pmonr *pmonr)
 	return __pmonr__in_istate(pmonr) && !__pmonr__in_ilstate(pmonr);
 }
 
+/* Whether the monr is root. Recall that the cgroups can not be root and yet
+ * point to a root monr.
+ */
 static inline bool monr__is_root(struct monr *monr)
 {
 	return monr_hrchy_root == monr;
@@ -164,6 +174,19 @@ static inline void __monr__clear_mon_active(struct monr *monr)
 	__monr__set_summary_read_rmid(monr, INVALID_RMID);
 	monr->flags &= ~MONR_MON_ACTIVE;
 }
+
+static inline bool monr_is_event_type(struct monr *monr)
+{
+	return !monr->mon_cgrp && monr->mon_event_group;
+}
+
+#ifdef CONFIG_CGROUP_PERF
+static inline struct cgroup_subsys_state *get_root_perf_css(void)
+{
+	/* Get css for root cgroup */
+	return  init_css_set.subsys[perf_event_cgrp_id];
+}
+#endif
 
 static inline bool __valid_pkg_id(u16 pkg_id)
 {
@@ -706,6 +729,7 @@ static struct monr *monr_alloc(void)
 	monr->parent = NULL;
 	INIT_LIST_HEAD(&monr->children);
 	INIT_LIST_HEAD(&monr->parent_entry);
+	monr->mon_cgrp = NULL;
 	monr->mon_event_group = NULL;
 
 	monr->pmonrs = kmalloc(
@@ -934,7 +958,7 @@ retry:
 }
 
 /*
- * Wrappers for monr manipulation in events.
+ * Wrappers for monr manipulation in events and cgroups.
  *
  */
 static inline struct monr *monr_from_event(struct perf_event *event)
@@ -946,6 +970,100 @@ static inline void event_set_monr(struct perf_event *event, struct monr *monr)
 {
 	WRITE_ONCE(event->hw.cqm_monr, monr);
 }
+
+#ifdef CONFIG_CGROUP_PERF
+static inline struct monr *monr_from_perf_cgroup(struct perf_cgroup *cgrp)
+{
+	struct monr *monr;
+	struct cgrp_cqm_info *cqm_info;
+
+	cqm_info = (struct cgrp_cqm_info *)READ_ONCE(cgrp->arch_info);
+	WARN_ON_ONCE(!cqm_info);
+	monr = READ_ONCE(cqm_info->monr);
+	return monr;
+}
+
+static inline struct perf_cgroup *monr__get_mon_cgrp(struct monr *monr)
+{
+	WARN_ON_ONCE(!monr);
+	return READ_ONCE(monr->mon_cgrp);
+}
+
+static inline void
+monr__set_mon_cgrp(struct monr *monr, struct perf_cgroup *cgrp)
+{
+	WRITE_ONCE(monr->mon_cgrp, cgrp);
+}
+
+static inline void
+perf_cgroup_set_monr(struct perf_cgroup *cgrp, struct monr *monr)
+{
+	WRITE_ONCE(cgrp_to_cqm_info(cgrp)->monr, monr);
+}
+
+/*
+ * A perf_cgroup is monitored when it's set in a monr->mon_cgrp.
+ * There is a many-to-one relationship between perf_cgroup's monrs
+ * and monrs' mon_cgrp. A monitored cgroup is necesarily referenced
+ * back by its monr's mon_cgrp.
+ */
+static inline bool perf_cgroup_is_monitored(struct perf_cgroup *cgrp)
+{
+	struct monr *monr;
+	struct perf_cgroup *monr_cgrp;
+
+	/* monr can be referenced by a cgroup other than the one in its
+	 * mon_cgrp, be careful.
+	 */
+	monr = monr_from_perf_cgroup(cgrp);
+
+	monr_cgrp = monr__get_mon_cgrp(monr);
+	/* Root monr do not have a cgroup associated before initialization.
+	 * mon_cgrp and mon_event_group are union, so the pointer must be set
+	 * for all non-root monrs.
+	 */
+	return  monr_cgrp && monr__get_mon_cgrp(monr) == cgrp;
+}
+
+/* Set css's monr to the monr of its lowest monitored ancestor. */
+static inline void __css_set_monr_to_lma(struct cgroup_subsys_state *css)
+{
+	lockdep_assert_held(&cqm_mutex);
+	if (!css->parent) {
+		perf_cgroup_set_monr(css_to_perf_cgroup(css), monr_hrchy_root);
+		return;
+	}
+	perf_cgroup_set_monr(
+		css_to_perf_cgroup(css),
+		monr_from_perf_cgroup(css_to_perf_cgroup(css->parent)));
+}
+
+static inline void
+perf_cgroup_make_monitored(struct perf_cgroup *cgrp, struct monr *monr)
+{
+	monr_hrchy_assert_held_mutexes();
+	perf_cgroup_set_monr(cgrp, monr);
+	/* Make sure that monr is a valid monr for css before it's visible
+	 * to any reader of css.
+	 */
+	smp_wmb();
+	monr__set_mon_cgrp(monr, cgrp);
+}
+
+static inline void
+perf_cgroup_make_unmonitored(struct perf_cgroup *cgrp)
+{
+	struct monr *monr = monr_from_perf_cgroup(cgrp);
+
+	monr_hrchy_assert_held_mutexes();
+	__css_set_monr_to_lma(&cgrp->css);
+	/* Make sure that all readers of css'monr see lma css before
+	 * monr stops being a valid monr for css.
+	 */
+	smp_wmb();
+	monr__set_mon_cgrp(monr, NULL);
+}
+#endif
 
 /*
  * Always finds a rmid_entry to schedule. To be called during scheduler.
@@ -1055,6 +1173,286 @@ __monr_hrchy_remove_leaf(struct monr *monr)
 	monr->parent = NULL;
 }
 
+#ifdef CONFIG_CGROUP_PERF
+static struct perf_cgroup *__perf_cgroup_parent(struct perf_cgroup *cgrp)
+{
+	struct cgroup_subsys_state *parent_css = cgrp->css.parent;
+
+	if (parent_css)
+		return css_to_perf_cgroup(parent_css);
+	return NULL;
+}
+
+/* Get cgroup for both task and cgroup event. */
+static inline struct perf_cgroup *
+perf_cgroup_from_event(struct perf_event *event)
+{
+#ifdef CONFIG_LOCKDEP
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+	bool rcu_safe = lockdep_is_held(
+		&cqm_pkgs_data[pkg_id]->pkg_data_lock);
+#endif
+
+	if (!(event->attach_state & PERF_ATTACH_TASK))
+		return event->cgrp;
+
+	return container_of(
+		task_css_check(event->hw.target, perf_event_cgrp_id, rcu_safe),
+		struct perf_cgroup, css);
+}
+
+/* Find lowest ancestor that is monitored, not including this cgrp.
+ * Return NULL if no ancestor is monitored.
+ */
+struct perf_cgroup *__cgroup_find_lma(struct perf_cgroup *cgrp)
+{
+	do {
+		cgrp = __perf_cgroup_parent(cgrp);
+	} while (cgrp && !perf_cgroup_is_monitored(cgrp));
+	return cgrp;
+}
+
+/* Similar to css_next_descendant_pre but skips the subtree rooted by pos. */
+struct cgroup_subsys_state *
+css_skip_subtree_pre(struct cgroup_subsys_state *pos,
+		     struct cgroup_subsys_state *root)
+{
+	struct cgroup_subsys_state *next;
+
+	WARN_ON_ONCE(!pos);
+	while (pos != root) {
+		next = css_next_child(pos, pos->parent);
+		if (next)
+			return next;
+		pos = pos->parent;
+	}
+	return NULL;
+}
+
+/* Make all monrs of css descendants of css to depend on new_monr. */
+inline void __css_subtree_update_monrs(struct cgroup_subsys_state *css,
+				       struct monr *new_monr)
+{
+	struct cgroup_subsys_state *pos_css;
+	int i;
+	unsigned long flags;
+
+	lockdep_assert_held(&cqm_mutex);
+	monr_hrchy_assert_held_mutexes();
+
+	rcu_read_lock();
+
+	/* Iterate over descendants of css in pre-order, in a way
+	 * similar to css_for_each_descendant_pre, but skipping the subtrees
+	 * rooted by css's with a monitored cgroup, since the elements
+	 * in those subtrees do not need to be updated.
+	 */
+	pos_css = css_next_descendant_pre(css, css);
+	while (pos_css) {
+		struct perf_cgroup *pos_cgrp = css_to_perf_cgroup(pos_css);
+		struct monr *pos_monr = monr_from_perf_cgroup(pos_cgrp);
+
+		/* Skip css that are not online, sync'ed with cqm_mutex. */
+		if (!(pos_css->flags & CSS_ONLINE)) {
+			pos_css = css_next_descendant_pre(pos_css, css);
+			continue;
+		}
+		/* Update descendant pos's mnor pointers to monr_parent. */
+		if (!perf_cgroup_is_monitored(pos_cgrp)) {
+			perf_cgroup_set_monr(pos_cgrp, new_monr);
+			pos_css = css_next_descendant_pre(pos_css, css);
+			continue;
+		}
+		monr_hrchy_acquire_raw_spin_locks_irq_save(flags, i);
+		pos_monr->parent = new_monr;
+		list_move_tail(&pos_monr->parent_entry, &new_monr->children);
+		monr_hrchy_release_raw_spin_locks_irq_restore(flags, i);
+		/* Dont go down the subtree in pos_css since pos_monr is the
+		 * lma for all its descendants.
+		 */
+		pos_css = css_skip_subtree_pre(pos_css, css);
+	}
+	rcu_read_unlock();
+}
+
+static inline int __css_start_monitoring(struct cgroup_subsys_state *css)
+{
+	struct perf_cgroup *cgrp, *cgrp_lma, *pos_cgrp;
+	struct monr *monr, *monr_parent, *pos_monr, *tmp_monr;
+	unsigned long flags;
+	int i;
+
+	lockdep_assert_held(&cqm_mutex);
+
+	/* Hold mutexes to prevent all rotation threads in all packages from
+	 * messing with this.
+	 */
+	monr_hrchy_acquire_mutexes();
+	cgrp = css_to_perf_cgroup(css);
+	if (WARN_ON_ONCE(perf_cgroup_is_monitored(cgrp)))
+		return -1;
+
+	/* When css is root cgroup's css, attach to the pre-existing
+	 * and active root monr.
+	 */
+	cgrp_lma = __cgroup_find_lma(cgrp);
+	if (!cgrp_lma) {
+		/* monr of root cgrp must be monr_hrchy_root. */
+		WARN_ON_ONCE(!monr__is_root(monr_from_perf_cgroup(cgrp)));
+		perf_cgroup_make_monitored(cgrp, monr_hrchy_root);
+		monr_hrchy_release_mutexes();
+		return 0;
+	}
+	/* The monr for the lowest monitored ancestor is direct ancestor
+	 * of monr in the monr hierarchy.
+	 */
+	monr_parent = monr_from_perf_cgroup(cgrp_lma);
+
+	/* Create new monr. */
+	monr = monr_alloc();
+	if (IS_ERR(monr)) {
+		monr_hrchy_release_mutexes();
+		return PTR_ERR(monr);
+	}
+
+	/* monr has no children yet so it is to be inserted in hierarchy with
+	 * all its pmors in (U)state.
+	 * We hold locks until monr_hrchy changes are complete, to prevent
+	 * possible state transition for the pmonrs in monr while still
+	 * allowing to read the prmid_summary in the scheduler path.
+	 */
+	monr_hrchy_acquire_raw_spin_locks_irq_save(flags, i);
+	__monr_hrchy_insert_leaf(monr, monr_parent);
+	monr_hrchy_release_raw_spin_locks_irq_restore(flags, i);
+
+	/* Make sure monr is in hierarchy before attaching monr to cgroup. */
+	barrier();
+
+	perf_cgroup_make_monitored(cgrp, monr);
+	__css_subtree_update_monrs(css, monr);
+
+	monr_hrchy_acquire_raw_spin_locks_irq_save(flags, i);
+	/* Move task-event monrs that are descendant from css's cgroup. */
+	list_for_each_entry_safe(pos_monr, tmp_monr,
+				 &monr_parent->children, parent_entry) {
+		if (!monr_is_event_type(pos_monr))
+			continue;
+		/* all events in event group must have the same cgroup.
+		 * No RCU read lock necessary for task_css_check since calling
+		 * inside critical section.
+		 */
+		pos_cgrp = perf_cgroup_from_event(pos_monr->mon_event_group);
+		if (!cgroup_is_descendant(pos_cgrp->css.cgroup,
+					  cgrp->css.cgroup))
+			continue;
+		pos_monr->parent = monr;
+		list_move_tail(&pos_monr->parent_entry, &monr->children);
+	}
+	/* Make sure monitoring starts after all monrs have moved. */
+	barrier();
+
+	__monr__set_mon_active(monr);
+	monr_hrchy_release_raw_spin_locks_irq_restore(flags, i);
+
+	monr_hrchy_release_mutexes();
+	return 0;
+}
+
+static inline int __css_stop_monitoring(struct cgroup_subsys_state *css)
+{
+	struct perf_cgroup *cgrp, *cgrp_lma;
+	struct monr *monr, *monr_parent, *pos_monr;
+	unsigned long flags;
+	int i;
+
+	lockdep_assert_held(&cqm_mutex);
+
+	monr_hrchy_acquire_mutexes();
+	cgrp = css_to_perf_cgroup(css);
+	if (WARN_ON_ONCE(!perf_cgroup_is_monitored(cgrp)))
+		return -1;
+
+	monr = monr_from_perf_cgroup(cgrp);
+
+	/* When css is root cgroup's css, detach cgroup but do not
+	 * destroy monr.
+	 */
+	cgrp_lma = __cgroup_find_lma(cgrp);
+	if (!cgrp_lma) {
+		/* monr of root cgrp must be monr_hrchy_root. */
+		WARN_ON_ONCE(!monr__is_root(monr_from_perf_cgroup(cgrp)));
+		perf_cgroup_make_unmonitored(cgrp);
+		monr_hrchy_release_mutexes();
+		return 0;
+	}
+	/* The monr for the lowest monitored ancestor is direct ancestor
+	 * of monr in the monr hierarchy.
+	 */
+	monr_parent = monr_from_perf_cgroup(cgrp_lma);
+
+	/* Lock together the transition to (U)state and clearing
+	 * MONR_MON_ACTIVE to prevent prmids to return to (A)state
+	 * or (I)state in between.
+	 */
+	monr_hrchy_acquire_raw_spin_locks_irq_save(flags, i);
+	cqm_pkg_id_for_each_online(i)
+		__pmonr__to_ustate(monr->pmonrs[i]);
+	barrier();
+	__monr__clear_mon_active(monr);
+	monr_hrchy_release_raw_spin_locks_irq_restore(flags, i);
+
+	__css_subtree_update_monrs(css, monr_parent);
+
+
+	/*
+	 * Move the children monrs that are no cgroups.
+	 */
+	monr_hrchy_acquire_raw_spin_locks_irq_save(flags, i);
+
+	list_for_each_entry(pos_monr, &monr->children, parent_entry)
+		pos_monr->parent = monr_parent;
+	list_splice_tail_init(&monr->children, &monr_parent->children);
+	perf_cgroup_make_unmonitored(cgrp);
+	__monr_hrchy_remove_leaf(monr);
+
+	monr_hrchy_release_raw_spin_locks_irq_restore(flags, i);
+
+	monr_hrchy_release_mutexes();
+	monr_dealloc(monr);
+	return 0;
+}
+
+/* Attaching an event to a cgroup starts monitoring in the cgroup.
+ * If the cgroup is already monitoring, just use its pre-existing mnor.
+ */
+static int __monr_hrchy_attach_cgroup_event(struct perf_event *event,
+					    struct perf_cgroup *perf_cgrp)
+{
+	struct monr *monr;
+	int ret;
+
+	lockdep_assert_held(&cqm_mutex);
+	WARN_ON_ONCE(event->attach_state & PERF_ATTACH_TASK);
+	WARN_ON_ONCE(monr_from_event(event));
+	WARN_ON_ONCE(!perf_cgrp);
+
+	if (!perf_cgroup_is_monitored(perf_cgrp)) {
+		css_get(&perf_cgrp->css);
+		ret = __css_start_monitoring(&perf_cgrp->css);
+		css_put(&perf_cgrp->css);
+		if (ret)
+			return ret;
+	}
+
+	/* At this point, cgrp is always monitored, use its monr. */
+	monr = monr_from_perf_cgroup(perf_cgrp);
+
+	event_set_monr(event, monr);
+	monr->mon_event_group = event;
+	return 0;
+}
+#endif
+
 static int __monr_hrchy_attach_cpu_event(struct perf_event *event)
 {
 	lockdep_assert_held(&cqm_mutex);
@@ -1096,12 +1494,30 @@ static int __monr_hrchy_attach_task_event(struct perf_event *event,
 static int monr_hrchy_attach_event(struct perf_event *event)
 {
 	struct monr *monr_parent;
+	bool has_cgrp = false;
+#ifdef CONFIG_CGROUP_PERF
+	struct perf_cgroup *perf_cgrp;
 
-	if (!event->cgrp && !(event->attach_state & PERF_ATTACH_TASK))
+	has_cgrp = event->cgrp;
+#endif
+
+	if (!has_cgrp && !(event->attach_state & PERF_ATTACH_TASK))
 		return __monr_hrchy_attach_cpu_event(event);
 
+#ifdef CONFIG_CGROUP_PERF
+	/* Task events become leaves, cgroup events reuse the cgroup's monr */
+	if (event->cgrp)
+		return __monr_hrchy_attach_cgroup_event(event, event->cgrp);
+
+	rcu_read_lock();
+	perf_cgrp = perf_cgroup_from_event(event);
+	rcu_read_unlock();
+
+	monr_parent = monr_from_perf_cgroup(perf_cgrp);
+#else
 	/* Two-levels hierarchy: Root and all event monr underneath it. */
 	monr_parent = monr_hrchy_root;
+#endif
 	return __monr_hrchy_attach_task_event(event, monr_parent);
 }
 
@@ -1113,7 +1529,7 @@ static int monr_hrchy_attach_event(struct perf_event *event)
  */
 static bool __match_event(struct perf_event *a, struct perf_event *b)
 {
-	/* Per-cpu and task events don't mix */
+	/* Cgroup/non-task per-cpu and task events don't mix */
 	if ((a->attach_state & PERF_ATTACH_TASK) !=
 	    (b->attach_state & PERF_ATTACH_TASK))
 		return false;
@@ -2171,6 +2587,129 @@ static struct pmu intel_cqm_pmu = {
 	.read		     = intel_cqm_event_read,
 };
 
+#ifdef CONFIG_CGROUP_PERF
+/* XXX: Add hooks for attach dettach task with monr to a cgroup. */
+int perf_cgroup_arch_css_alloc(struct cgroup_subsys_state *parent_css,
+				      struct cgroup_subsys_state *new_css)
+{
+	struct perf_cgroup *new_cgrp;
+	struct cgrp_cqm_info *cqm_info;
+
+	new_cgrp = css_to_perf_cgroup(new_css);
+	cqm_info = kmalloc(sizeof(struct cgrp_cqm_info), GFP_KERNEL);
+	if (!cqm_info)
+		return -ENOMEM;
+	cqm_info->cont_monitoring = false;
+	cqm_info->monr = NULL;
+	new_cgrp->arch_info = cqm_info;
+
+	return 0;
+}
+
+void perf_cgroup_arch_css_free(struct cgroup_subsys_state *css)
+{
+	struct perf_cgroup *cgrp = css_to_perf_cgroup(css);
+
+	kfree(cgrp_to_cqm_info(cgrp));
+	cgrp->arch_info = NULL;
+}
+
+/* Do the bulk of arch_css_online. To be called when CQM starts after
+ * css has gone online.
+ */
+static inline int __css_go_online(struct cgroup_subsys_state *css)
+{
+	lockdep_assert_held(&cqm_mutex);
+
+	/* css must not be used in monr hierarchy before having
+	 * set its monr in this step.
+	 */
+	__css_set_monr_to_lma(css);
+	/* Root monr is always monitoring. */
+	if (!css->parent)
+		css_to_cqm_info(css)->cont_monitoring = true;
+
+	if (css_to_cqm_info(css)->cont_monitoring)
+		return __css_start_monitoring(css);
+	return 0;
+}
+
+int perf_cgroup_arch_css_online(struct cgroup_subsys_state *css)
+{
+	int ret = 0;
+
+	/* use cqm_init_mutex to synchronize with
+	 * __start_monitoring_all_cgroups.
+	 */
+	mutex_lock(&cqm_init_mutex);
+
+	if (static_branch_unlikely(&cqm_initialized_key)) {
+		mutex_lock(&cqm_mutex);
+		ret = __css_go_online(css);
+		mutex_unlock(&cqm_mutex);
+		WARN_ON_ONCE(ret);
+	}
+
+	mutex_unlock(&cqm_init_mutex);
+	return ret;
+}
+
+void perf_cgroup_arch_css_offline(struct cgroup_subsys_state *css)
+{
+	int ret = 0;
+	struct monr *monr;
+	struct perf_cgroup *cgrp = css_to_perf_cgroup(css);
+
+	mutex_lock(&cqm_init_mutex);
+
+	if (!static_branch_unlikely(&cqm_initialized_key))
+		goto out;
+
+	mutex_lock(&cqm_mutex);
+
+	monr = monr_from_perf_cgroup(cgrp);
+	if (!perf_cgroup_is_monitored(cgrp))
+		goto out_cqm;
+
+	/* Stop monitoring for the css's monr only if no more events need it.
+	 * If events need the monr, it will be destroyed when the events that
+	 * use it are destroyed.
+	 */
+	if (monr->mon_event_group) {
+		monr_hrchy_acquire_mutexes();
+		perf_cgroup_make_unmonitored(cgrp);
+		monr_hrchy_release_mutexes();
+	} else {
+		ret = __css_stop_monitoring(css);
+		WARN_ON_ONCE(ret);
+	}
+
+out_cqm:
+	mutex_unlock(&cqm_mutex);
+out:
+	mutex_unlock(&cqm_init_mutex);
+	WARN_ON_ONCE(ret);
+}
+
+void perf_cgroup_arch_css_released(struct cgroup_subsys_state *css)
+{
+	mutex_lock(&cqm_init_mutex);
+
+	if (static_branch_unlikely(&cqm_initialized_key)) {
+		mutex_lock(&cqm_mutex);
+		/*
+		 * Remove css from monr hierarchy now that css is about to
+		 * leave the cgroup hierarchy.
+		 */
+		perf_cgroup_set_monr(css_to_perf_cgroup(css), NULL);
+		mutex_unlock(&cqm_mutex);
+	}
+
+	mutex_unlock(&cqm_init_mutex);
+}
+
+#endif
+
 static inline void cqm_pick_event_reader(int cpu)
 {
 	u16 pkg_id = topology_physical_package_id(cpu);
@@ -2234,6 +2773,39 @@ static const struct x86_cpu_id intel_cqm_match[] = {
 	{ .vendor = X86_VENDOR_INTEL, .feature = X86_FEATURE_CQM_OCCUP_LLC },
 	{}
 };
+
+#ifdef CONFIG_CGROUP_PERF
+/* Start monitoring for all cgroups in cgroup hierarchy. */
+static int __start_monitoring_all_cgroups(void)
+{
+	int ret;
+	struct cgroup_subsys_state *css, *css_root;
+
+	lockdep_assert_held(&cqm_init_mutex);
+
+	rcu_read_lock();
+	/* Get css for root cgroup */
+	css_root =  get_root_perf_css();
+
+	css_for_each_descendant_pre(css, css_root) {
+		if (!css_tryget_online(css))
+			continue;
+
+		rcu_read_unlock();
+		mutex_lock(&cqm_mutex);
+		ret = __css_go_online(css);
+		mutex_unlock(&cqm_mutex);
+
+		css_put(css);
+		if (ret)
+			return ret;
+
+		rcu_read_lock();
+	}
+	rcu_read_unlock();
+	return 0;
+}
+#endif
 
 static int __init intel_cqm_init(void)
 {
@@ -2316,17 +2888,32 @@ static int __init intel_cqm_init(void)
 
 	__perf_cpu_notifier(intel_cqm_cpu_notifier);
 
+	/* Use cqm_init_mutex to synchronize with css's online/offline. */
+	mutex_lock(&cqm_init_mutex);
+
+#ifdef CONFIG_CGROUP_PERF
+	ret = __start_monitoring_all_cgroups();
+	if (ret)
+		goto error_init_mutex;
+#endif
+
 	ret = perf_pmu_register(&intel_cqm_pmu, "intel_cqm", -1);
 	if (ret)
-		goto error;
+		goto error_init_mutex;
 
 	cpu_notifier_register_done();
+
+	static_branch_enable(&cqm_initialized_key);
+
+	mutex_unlock(&cqm_init_mutex);
 
 	pr_info("Intel CQM monitoring enabled with at least %u rmids per package.\n",
 		min_max_rmid + 1);
 
 	return ret;
 
+error_init_mutex:
+	mutex_unlock(&cqm_init_mutex);
 error:
 	pr_err("Intel CQM perf registration failed: %d\n", ret);
 	cpu_notifier_register_done();
