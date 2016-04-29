@@ -334,6 +334,8 @@ extern struct cftype perf_event_cgrp_arch_subsys_cftypes[];
 	.dfl_cftypes = perf_event_cgrp_arch_subsys_cftypes, \
 	.legacy_cftypes = perf_event_cgrp_arch_subsys_cftypes,
 
+#define perf_event_arch_exec pqr_ctx_switch
+
 #else
 
 #define PERF_CGROUP_ARCH_CGRP_SUBSYS_ATTS

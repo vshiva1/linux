@@ -1394,4 +1394,9 @@ static struct device_attribute format_attr_##_name = __ATTR_RO(_name)
 #define PERF_CGROUP_ARCH_CGRP_SUBSYS_ATTS
 #endif
 
+#ifndef perf_event_arch_exec
+#define perf_event_arch_exec() do { } while (0)
+#endif
+
+
 #endif /* _LINUX_PERF_EVENT_H */

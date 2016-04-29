@@ -6051,6 +6051,7 @@ void perf_event_exec(void)
 				   true);
 	}
 	rcu_read_unlock();
+	perf_event_arch_exec();
 }
 
 struct remote_output {
