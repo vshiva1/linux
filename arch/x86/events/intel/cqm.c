@@ -2689,6 +2689,16 @@ static int intel_cqm_event_init(struct perf_event *event)
 	 */
 	event->pmu_event_flags |= PERF_CGROUP_NO_RECURSION;
 
+	/* Events in CQM PMU are per-package and can be read even when
+	 * the cpu is not running the event.
+	 */
+	if (event->cpu < 0) {
+		WARN_ON_ONCE(!(event->attach_state & PERF_ATTACH_TASK));
+		event->pmu_event_flags |= PERF_INACTIVE_EV_READ_ANY_CPU;
+	} else	{
+		event->pmu_event_flags |= PERF_INACTIVE_CPU_READ_PKG;
+	}
+
 	mutex_lock(&cqm_mutex);
 
 
