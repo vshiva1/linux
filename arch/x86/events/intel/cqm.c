@@ -2514,9 +2514,8 @@ static inline void __intel_cqm_event_start(
 {
 	if (!(event->hw.state & PERF_HES_STOPPED))
 		return;
-
 	event->hw.state &= ~PERF_HES_STOPPED;
-	pqr_update_rmid(summary.sched_rmid);
+	pqr_update_rmid(summary.sched_rmid, PQR_RMID_MODE_EVENT);
 }
 
 static void intel_cqm_event_start(struct perf_event *event, int mode)
@@ -2546,7 +2545,7 @@ static void intel_cqm_event_stop(struct perf_event *event, int mode)
 	/* Occupancy of CQM events is obtained at read. No need to read
 	 * when event is stopped since read on inactive cpus succeed.
 	 */
-	pqr_update_rmid(summary.sched_rmid);
+	pqr_update_rmid(summary.sched_rmid, PQR_RMID_MODE_NOEVENT);
 }
 
 static int intel_cqm_event_add(struct perf_event *event, int mode)
@@ -2963,6 +2962,7 @@ static void intel_cqm_cpu_starting(unsigned int cpu)
 	u16 pkg_id = topology_physical_package_id(cpu);
 
 	state->rmid = 0;
+	state->rmid_mode = PQR_RMID_MODE_NOEVENT;
 	state->closid = 0;
 
 	/* XXX: lock */
@@ -3145,6 +3145,12 @@ static int __init intel_cqm_init(void)
 	pr_info("Intel CQM monitoring enabled with at least %u rmids per package.\n",
 		min_max_rmid + 1);
 
+	/* Make sure pqr_common_enable_key is enabled after
+	 * cqm_initialized_key.
+	 */
+	barrier();
+
+	static_branch_enable(&pqr_common_enable_key);
 	return ret;
 
 error_init_mutex:
@@ -3154,6 +3160,43 @@ error:
 	cpu_notifier_register_done();
 
 	return ret;
+}
+
+/* Schedule task without a CQM perf_event. */
+inline void __intel_cqm_no_event_sched_in(void)
+{
+#ifdef CONFIG_CGROUP_PERF
+	struct monr *monr;
+	struct pmonr *pmonr;
+	union prmid_summary summary;
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+	struct pmonr *root_pmonr = monr_hrchy_root->pmonrs[pkg_id];
+
+	/* Assume CQM enabled is likely given that PQR is enabled. */
+	if (!static_branch_likely(&cqm_initialized_key))
+		return;
+
+	/* Safe to call from_task since we are in scheduler lock. */
+	monr = monr_from_perf_cgroup(perf_cgroup_from_task(current, NULL));
+	pmonr = monr->pmonrs[pkg_id];
+
+	/* Utilize most up to date pmonr summary. */
+	monr_hrchy_get_next_prmid_summary(pmonr);
+	summary.value = atomic64_read(&pmonr->prmid_summary_atomic);
+
+	if (!prmid_summary__is_mon_active(summary))
+		goto no_rmid;
+
+	if (WARN_ON_ONCE(!__valid_rmid(pkg_id, summary.sched_rmid)))
+		goto no_rmid;
+
+	pqr_update_rmid(summary.sched_rmid, PQR_RMID_MODE_NOEVENT);
+	return;
+
+no_rmid:
+	summary.value = atomic64_read(&root_pmonr->prmid_summary_atomic);
+	pqr_update_rmid(summary.sched_rmid, PQR_RMID_MODE_NOEVENT);
+#endif
 }
 
 device_initcall(intel_cqm_init);
