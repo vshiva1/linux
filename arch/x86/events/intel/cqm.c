@@ -3201,4 +3201,85 @@ no_rmid:
 #endif
 }
 
+#ifdef CONFIG_CGROUP_PERF
+
+/* kernfs guarantees that css doesn't need to be pinned. */
+static u64 cqm_cont_monitoring_read_u64(struct cgroup_subsys_state *css,
+					struct cftype *cft)
+{
+	int ret = -1;
+	struct perf_cgroup *perf_cgrp = css_to_perf_cgroup(css);
+	struct monr *monr;
+
+	mutex_lock(&cqm_init_mutex);
+	if (!static_branch_likely(&cqm_initialized_key))
+		goto out;
+
+	mutex_lock(&cqm_mutex);
+
+	ret = css_to_cqm_info(css)->cont_monitoring;
+	monr = monr_from_perf_cgroup(perf_cgrp);
+	WARN_ON(!monr->mon_event_group &&
+		(ret != perf_cgroup_is_monitored(perf_cgrp)));
+
+	mutex_unlock(&cqm_mutex);
+out:
+	mutex_unlock(&cqm_init_mutex);
+	return ret;
+}
+
+/* kernfs guarantees that css doesn't need to be pinned. */
+static int cqm_cont_monitoring_write_u64(struct cgroup_subsys_state *css,
+					 struct cftype *cft, u64 value)
+{
+	int ret = 0;
+	struct perf_cgroup *perf_cgrp = css_to_perf_cgroup(css);
+	struct monr *monr;
+
+	if (value > 1)
+		return -1;
+
+	mutex_lock(&cqm_init_mutex);
+	if (!static_branch_likely(&cqm_initialized_key)) {
+		ret = -1;
+		goto out;
+	}
+
+	/* Root cgroup cannot stop being monitored. */
+	if (css == get_root_perf_css())
+		goto out;
+
+	mutex_lock(&cqm_mutex);
+
+	monr = monr_from_perf_cgroup(perf_cgrp);
+
+	if (value && !perf_cgroup_is_monitored(perf_cgrp))
+		ret = __css_start_monitoring(css);
+	else if (!value &&
+		 !monr->mon_event_group && perf_cgroup_is_monitored(perf_cgrp))
+		ret = __css_stop_monitoring(css);
+
+	WARN_ON(!monr->mon_event_group &&
+		(value != perf_cgroup_is_monitored(perf_cgrp)));
+
+	css_to_cqm_info(css)->cont_monitoring = value;
+
+	mutex_unlock(&cqm_mutex);
+out:
+	mutex_unlock(&cqm_init_mutex);
+	return ret;
+}
+
+struct cftype perf_event_cgrp_arch_subsys_cftypes[] = {
+	{
+		.name = "cqm_cont_monitoring",
+		.read_u64 = cqm_cont_monitoring_read_u64,
+		.write_u64 = cqm_cont_monitoring_write_u64,
+	},
+
+	{}	/* terminate */
+};
+
+#endif
+
 device_initcall(intel_cqm_init);

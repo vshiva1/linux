@@ -328,6 +328,16 @@ void perf_cgroup_arch_css_released(struct cgroup_subsys_state *css);
 	perf_cgroup_arch_css_free
 void perf_cgroup_arch_css_free(struct cgroup_subsys_state *css);
 
+extern struct cftype perf_event_cgrp_arch_subsys_cftypes[];
+
+#define PERF_CGROUP_ARCH_CGRP_SUBSYS_ATTS \
+	.dfl_cftypes = perf_event_cgrp_arch_subsys_cftypes, \
+	.legacy_cftypes = perf_event_cgrp_arch_subsys_cftypes,
+
+#else
+
+#define PERF_CGROUP_ARCH_CGRP_SUBSYS_ATTS
+
 #endif
 #endif
 
