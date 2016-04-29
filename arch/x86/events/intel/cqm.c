@@ -170,6 +170,8 @@ static inline bool __valid_pkg_id(u16 pkg_id)
 	return pkg_id < topology_max_packages();
 }
 
+static int anode_pool__alloc_one(u16 pkg_id);
+
 /* Init cqm pkg_data for @cpu 's package. */
 static int pkg_data_init_cpu(int cpu)
 {
@@ -222,10 +224,18 @@ static int pkg_data_init_cpu(int cpu)
 	mutex_init(&pkg_data->pkg_data_mutex);
 	raw_spin_lock_init(&pkg_data->pkg_data_lock);
 
+	INIT_LIST_HEAD(&pkg_data->anode_pool_head);
+	raw_spin_lock_init(&pkg_data->anode_pool_lock);
+
 	INIT_DELAYED_WORK(
 		&pkg_data->rotation_work, intel_cqm_rmid_rotation_work);
 	/* XXX: Chose randomly*/
 	pkg_data->rotation_cpu = cpu;
+
+	INIT_DELAYED_WORK(
+		&pkg_data->timed_update_work, intel_cqm_timed_update_work);
+	/* XXX: Chose randomly*/
+	pkg_data->timed_update_cpu = cpu;
 
 	cqm_pkgs_data[pkg_id] = pkg_data;
 	return 0;
@@ -728,6 +738,189 @@ static void monr_dealloc(struct monr *monr)
 		pmonr_dealloc(monr->pmonrs[i]);
 
 	kfree(monr);
+}
+
+/*
+ * Logic for reading sets of rmids into per-package lists.
+ * This package lists can be used to update occupancies without
+ * holding locks in the hierarchies of pmonrs.
+ * @pool: free pool.
+ */
+struct astack {
+	struct list_head	pool;
+	struct list_head	items;
+	int			top_idx;
+	int			max_idx;
+	u16			pkg_id;
+};
+
+static void astack__init(struct astack *astack, int max_idx, u16 pkg_id)
+{
+	INIT_LIST_HEAD(&astack->items);
+	INIT_LIST_HEAD(&astack->pool);
+	astack->top_idx = -1;
+	astack->max_idx = max_idx;
+	astack->pkg_id = pkg_id;
+}
+
+/* Try to enlarge astack->pool with a anode from this pkgs pool. */
+static int astack__try_add_pool(struct astack *astack)
+{
+	unsigned long flags;
+	int ret = -1;
+	struct pkg_data *pkg_data = cqm_pkgs_data[astack->pkg_id];
+
+	raw_spin_lock_irqsave(&pkg_data->anode_pool_lock, flags);
+
+	if (!list_empty(&pkg_data->anode_pool_head)) {
+		list_move_tail(pkg_data->anode_pool_head.prev, &astack->pool);
+		ret = 0;
+	}
+
+	raw_spin_unlock_irqrestore(&pkg_data->anode_pool_lock, flags);
+	return ret;
+}
+
+static int astack__push(struct astack *astack)
+{
+	if (!list_empty(&astack->items) && astack->top_idx < astack->max_idx) {
+		astack->top_idx++;
+		return 0;
+	}
+
+	if (list_empty(&astack->pool) && astack__try_add_pool(astack))
+		return -1;
+	list_move_tail(astack->pool.prev, &astack->items);
+	astack->top_idx = 0;
+	return 0;
+}
+
+/* Must be non-empty */
+# define __astack__top(astack_, member_) \
+	list_last_entry(&(astack_)->items, \
+	struct anode, entry)->member_[(astack_)->top_idx]
+
+static void astack__clear(struct astack *astack)
+{
+	list_splice_tail_init(&astack->items, &astack->pool);
+	astack->top_idx = -1;
+}
+
+/* Put back into pkg_data's pool. */
+static void astack__release(struct astack *astack)
+{
+	unsigned long flags;
+	struct pkg_data *pkg_data = cqm_pkgs_data[astack->pkg_id];
+
+	astack__clear(astack);
+	raw_spin_lock_irqsave(&pkg_data->anode_pool_lock, flags);
+	list_splice_tail_init(&astack->pool, &pkg_data->anode_pool_head);
+	raw_spin_unlock_irqrestore(&pkg_data->anode_pool_lock, flags);
+}
+
+static int anode_pool__alloc_one(u16 pkg_id)
+{
+	unsigned long flags;
+	struct anode *anode;
+	struct pkg_data *pkg_data = cqm_pkgs_data[pkg_id];
+
+	anode = kmalloc_node(sizeof(struct anode), GFP_KERNEL,
+			     cpu_to_node(pkg_data->rotation_cpu));
+	if (!anode)
+		return -ENOMEM;
+	raw_spin_lock_irqsave(&pkg_data->anode_pool_lock, flags);
+	list_add_tail(&anode->entry, &pkg_data->anode_pool_head);
+	raw_spin_unlock_irqrestore(&pkg_data->anode_pool_lock, flags);
+	return 0;
+}
+
+static int astack__end(struct astack *astack, struct anode *anode, int idx)
+{
+	return list_is_last(&anode->entry, &astack->items) &&
+	       idx > astack->top_idx;
+}
+
+static int __rmid_fn__cqm_prmid_update(struct prmid *prmid, u64 *val)
+{
+	int ret = cqm_prmid_update(prmid);
+
+	if (ret >= 0)
+		*val = atomic64_read(&prmid->last_read_value);
+	return ret;
+}
+
+/* Apply function to all elements in all nodes.
+ * On error returns first error in read, zero otherwise.
+ */
+static int astack__rmids_sum_apply(
+	struct astack *astack,
+	u16 pkg_id, int (*fn)(struct prmid *, u64 *), u64 *total)
+{
+	struct prmid *prmid;
+	struct anode *anode;
+	u32 rmid;
+	int i, ret, first_error = 0;
+	u64 count;
+	*total = 0;
+
+	list_for_each_entry(anode, &astack->items, entry) {
+		for (i = 0; i <= astack->max_idx; i++) {
+			/* node in tail only has astack->top_idx elements. */
+			if (astack__end(astack, anode, i))
+				break;
+			rmid = anode->rmids[i];
+			prmid = cqm_pkgs_data[pkg_id]->prmids_by_rmid[rmid];
+			WARN_ON_ONCE(!prmid);
+			ret = fn(prmid, &count);
+			if (ret < 0) {
+				if (!first_error)
+					first_error = ret;
+				continue;
+			}
+			*total += count;
+		}
+	}
+	return first_error;
+}
+
+/* Does not need mutex since protected by locks when transversing
+ * astate_pmonrs_lru and updating atomic prmids.
+ */
+static int update_rmids_in_astate_pmonrs_lru(u16 pkg_id)
+{
+	struct astack astack;
+	struct pkg_data *pkg_data;
+	struct pmonr *pmonr;
+	int ret = 0;
+	unsigned long flags;
+	u64 count;
+
+	astack__init(&astack, NR_RMIDS_PER_NODE - 1, pkg_id);
+	pkg_data = cqm_pkgs_data[pkg_id];
+
+retry:
+	if (ret) {
+		anode_pool__alloc_one(pkg_id);
+		ret = 0;
+	}
+	raw_spin_lock_irqsave_nested(&pkg_data->pkg_data_lock, flags, pkg_id);
+	list_for_each_entry(pmonr,
+			    &pkg_data->astate_pmonrs_lru, rotation_entry) {
+		ret = astack__push(&astack);
+		if (ret)
+			break;
+		__astack__top(&astack, rmids) = pmonr->prmid->rmid;
+	}
+	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+	if (ret) {
+		astack__clear(&astack);
+		goto retry;
+	}
+	/* count is not used. */
+	ret = astack__rmids_sum_apply(&astack, pkg_id,
+				      &__rmid_fn__cqm_prmid_update, &count);
+	astack__release(&astack);
+	return ret;
 }
 
 /*
@@ -1519,6 +1712,17 @@ exit:
 	mutex_unlock(&pkg_data->pkg_data_mutex);
 }
 
+static void
+__intel_cqm_timed_update(u16 pkg_id)
+{
+	int ret;
+
+	mutex_lock_nested(&cqm_pkgs_data[pkg_id]->pkg_data_mutex, pkg_id);
+	ret = update_rmids_in_astate_pmonrs_lru(pkg_id);
+	mutex_unlock(&cqm_pkgs_data[pkg_id]->pkg_data_mutex);
+	WARN_ON_ONCE(ret);
+}
+
 static struct pmu intel_cqm_pmu;
 
 /* Rotation only needs to be run when there is any pmonr in (I)state. */
@@ -1541,6 +1745,22 @@ static bool intel_cqm_need_rotation(u16 pkg_id)
 	return need_rot;
 }
 
+static bool intel_cqm_need_timed_update(u16 pkg_id)
+{
+
+	struct pkg_data *pkg_data;
+	bool need_update;
+
+	pkg_data = cqm_pkgs_data[pkg_id];
+
+	mutex_lock_nested(&pkg_data->pkg_data_mutex, pkg_id);
+	/* Update is needed if prmids if there is any active prmid. */
+	need_update = !list_empty(&pkg_data->active_prmids_pool);
+	mutex_unlock(&pkg_data->pkg_data_mutex);
+
+	return need_update;
+}
+
 /*
  * Schedule rotation in one package.
  */
@@ -1555,6 +1775,19 @@ static void __intel_cqm_schedule_rotation_for_pkg(u16 pkg_id)
 		pkg_data->rotation_cpu, &pkg_data->rotation_work, delay);
 }
 
+static void __intel_cqm_schedule_timed_update_for_pkg(u16 pkg_id)
+{
+	struct pkg_data *pkg_data;
+	unsigned long delay;
+
+	delay = msecs_to_jiffies(__rmid_timed_update_period);
+	pkg_data = cqm_pkgs_data[pkg_id];
+	schedule_delayed_work_on(
+		pkg_data->timed_update_cpu,
+		&pkg_data->timed_update_work, delay);
+}
+
+
 /*
  * Schedule rotation and rmid's timed update in all packages.
  * Reescheduling will stop when no longer needed.
@@ -1563,8 +1796,10 @@ static void intel_cqm_schedule_work_all_pkgs(void)
 {
 	int pkg_id;
 
-	cqm_pkg_id_for_each_online(pkg_id)
+	cqm_pkg_id_for_each_online(pkg_id) {
 		__intel_cqm_schedule_rotation_for_pkg(pkg_id);
+		__intel_cqm_schedule_timed_update_for_pkg(pkg_id);
+	}
 }
 
 static void intel_cqm_rmid_rotation_work(struct work_struct *work)
@@ -1583,6 +1818,20 @@ static void intel_cqm_rmid_rotation_work(struct work_struct *work)
 
 	if (intel_cqm_need_rotation(pkg_id))
 		__intel_cqm_schedule_rotation_for_pkg(pkg_id);
+}
+
+static void intel_cqm_timed_update_work(struct work_struct *work)
+{
+	struct pkg_data *pkg_data = container_of(
+		to_delayed_work(work), struct pkg_data, timed_update_work);
+	u16 pkg_id = topology_physical_package_id(pkg_data->timed_update_cpu);
+
+	WARN_ON_ONCE(pkg_data != cqm_pkgs_data[pkg_id]);
+
+	__intel_cqm_timed_update(pkg_id);
+
+	if (intel_cqm_need_timed_update(pkg_id))
+		__intel_cqm_schedule_timed_update_for_pkg(pkg_id);
 }
 
 /*

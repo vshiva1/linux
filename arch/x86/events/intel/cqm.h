@@ -49,6 +49,10 @@ static unsigned int __rmid_min_update_time = RMID_DEFAULT_MIN_UPDATE_TIME;
 
 static inline int cqm_prmid_update(struct prmid *prmid);
 
+#define RMID_DEFAULT_TIMED_UPDATE_PERIOD 100 /* ms */
+static unsigned int __rmid_timed_update_period =
+	RMID_DEFAULT_TIMED_UPDATE_PERIOD;
+
 /*
  * union prmid_summary: Machine-size summary of a pmonr's prmid state.
  * @value:		One word accesor.
@@ -213,6 +217,21 @@ struct pmonr {
 	atomic64_t				prmid_summary_atomic;
 };
 
+/* Store all RMIDs that can fit in a anode while keeping sizeof(struct anode)
+ * within one cache line (for performance).
+ */
+#define NR_TYPE_PER_NODE(__type) ((SMP_CACHE_BYTES - (int)sizeof(struct list_head)) / \
+	(int)sizeof(__type))
+
+#define NR_RMIDS_PER_NODE NR_TYPE_PER_NODE(u32)
+
+/* struct anode: Node of an array list used to temporarily store RMIDs. */
+struct anode {
+	/* Last valid RMID is RMID_INVALID */
+	u32			rmids[NR_RMIDS_PER_NODE];
+	struct list_head	entry;
+};
+
 /*
  * struct pkg_data: Per-package CQM data.
  * @max_rmid:			Max rmid valid for cpus in this package.
@@ -242,6 +261,14 @@ struct pmonr {
  * @rotation_work:		Task that performs rotation of prmids.
  * @rotation_cpu:               CPU to run @rotation_work on, it must be in the
  *                              package associated to this instance of pkg_data.
+ * @timed_update_work:		Task that performs periodic updates of values
+ *				for active rmids. These values are used when
+ *				inter-package event read is not available due to
+ *				irqs disabled contexts.
+ * @timed_update_cpu:		CPU to run @timed_update_work on, it must be a
+ *				cpu in this package.
+ * @anode_pool_head:		Pool of unused anodes.
+ * @anode_pool_lock:		Protect @anode_pool_head.
  */
 struct pkg_data {
 	u32			max_rmid;
@@ -271,6 +298,13 @@ struct pkg_data {
 
 	struct delayed_work	rotation_work;
 	int			rotation_cpu;
+
+	struct delayed_work	timed_update_work;
+	int			timed_update_cpu;
+
+	/* Pool of unused rmid_list_nodes and its lock */
+	struct list_head	anode_pool_head;
+	raw_spinlock_t		anode_pool_lock;
 };
 
 /*
@@ -440,6 +474,8 @@ static inline int monr_hrchy_count_held_raw_spin_locks(void)
  * cache lines allocated for this rmid will eventually be replaced.
  */
 static void intel_cqm_rmid_rotation_work(struct work_struct *work);
+
+static void intel_cqm_timed_update_work(struct work_struct *work);
 
 /*
  * Service Level Objectives (SLO) for the rotation logic.
