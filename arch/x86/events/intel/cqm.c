@@ -2476,6 +2476,14 @@ static int intel_cqm_event_init(struct perf_event *event)
 	INIT_LIST_HEAD(&event->hw.cqm_event_groups_entry);
 	INIT_LIST_HEAD(&event->hw.cqm_event_group_entry);
 
+	/*
+	 * CQM driver handles cgroup recursion and since only noe
+	 * RMID can be programmed at the time in each core, then
+	 * it is incompatible with the way generic code handles
+	 * cgroup hierarchies.
+	 */
+	event->pmu_event_flags |= PERF_CGROUP_NO_RECURSION;
+
 	mutex_lock(&cqm_mutex);
 
 
