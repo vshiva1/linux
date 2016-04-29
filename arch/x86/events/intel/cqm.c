@@ -2470,6 +2470,7 @@ static int intel_cqm_event_init(struct perf_event *event)
 	    event->attr.exclude_idle   ||
 	    event->attr.exclude_host   ||
 	    event->attr.exclude_guest  ||
+	    event->attr.inherit_stat   || /* cqm groups share rmid */
 	    event->attr.sample_period) /* no sampling */
 		return -EINVAL;
 
