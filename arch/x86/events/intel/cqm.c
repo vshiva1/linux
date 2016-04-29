@@ -92,13 +92,31 @@ struct pkg_data **cqm_pkgs_data;
 static inline bool __pmonr__in_astate(struct pmonr *pmonr)
 {
 	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
-	return pmonr->prmid;
+	return pmonr->prmid && !pmonr->ancestor_pmonr;
 }
 
 static inline bool __pmonr__in_ustate(struct pmonr *pmonr)
 {
 	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
-	return !pmonr->prmid;
+	return !pmonr->prmid && !pmonr->ancestor_pmonr;
+}
+
+static inline bool __pmonr__in_istate(struct pmonr *pmonr)
+{
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+	return pmonr->ancestor_pmonr;
+}
+
+static inline bool __pmonr__in_ilstate(struct pmonr *pmonr)
+{
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+	return __pmonr__in_istate(pmonr) && pmonr->limbo_prmid;
+}
+
+static inline bool __pmonr__in_instate(struct pmonr *pmonr)
+{
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+	return __pmonr__in_istate(pmonr) && !__pmonr__in_ilstate(pmonr);
 }
 
 static inline bool monr__is_root(struct monr *monr)
@@ -191,9 +209,12 @@ static int pkg_data_init_cpu(int cpu)
 
 	INIT_LIST_HEAD(&pkg_data->free_prmids_pool);
 	INIT_LIST_HEAD(&pkg_data->active_prmids_pool);
+	INIT_LIST_HEAD(&pkg_data->pmonr_limbo_prmids_pool);
 	INIT_LIST_HEAD(&pkg_data->nopmonr_limbo_prmids_pool);
 
 	INIT_LIST_HEAD(&pkg_data->astate_pmonrs_lru);
+	INIT_LIST_HEAD(&pkg_data->istate_pmonrs_lru);
+	INIT_LIST_HEAD(&pkg_data->ilstate_pmonrs_lru);
 
 	mutex_init(&pkg_data->pkg_data_mutex);
 	raw_spin_lock_init(&pkg_data->pkg_data_lock);
@@ -242,7 +263,15 @@ static struct pmonr *pmonr_alloc(int cpu)
 	if (!pmonr)
 		return ERR_PTR(-ENOMEM);
 
+	pmonr->ancestor_pmonr = NULL;
+
+	/*
+	 * Since (A)state and (I)state have union in members,
+	 * initialize one of them only.
+	 */
+	INIT_LIST_HEAD(&pmonr->pmonr_deps_head);
 	pmonr->prmid = NULL;
+	INIT_LIST_HEAD(&pmonr->limbo_rotation_entry);
 
 	pmonr->monr = NULL;
 	INIT_LIST_HEAD(&pmonr->rotation_entry);
@@ -308,6 +337,44 @@ __pmonr__finish_to_astate(struct pmonr *pmonr, struct prmid *prmid)
 	atomic64_set(&pmonr->prmid_summary_atomic, summary.value);
 }
 
+/*
+ * Transition to (A)state from (IN)state, given a valid prmid.
+ * Cannot fail. Updates ancestor dependants to use this pmonr as new ancestor.
+ */
+static inline void
+__pmonr__instate_to_astate(struct pmonr *pmonr, struct prmid *prmid)
+{
+	struct pmonr *pos, *tmp, *ancestor;
+	union prmid_summary old_summary, summary;
+
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+
+	/* If in (I) state, cannot have limbo_prmid, otherwise prmid
+	 * in function's argument is superfluous.
+	 */
+	WARN_ON_ONCE(pmonr->limbo_prmid);
+
+	/* Do not depend on ancestor_pmonr anymore. Make it (A)state. */
+	ancestor = pmonr->ancestor_pmonr;
+	list_del_init(&pmonr->pmonr_deps_entry);
+	pmonr->ancestor_pmonr = NULL;
+	__pmonr__finish_to_astate(pmonr, prmid);
+
+	/* Update ex ancestor's dependants that are pmonr descendants. */
+	list_for_each_entry_safe(pos, tmp, &ancestor->pmonr_deps_head,
+				 pmonr_deps_entry) {
+		if (!__monr_hrchy_is_ancestor(monr_hrchy_root,
+					      pmonr->monr, pos->monr))
+			continue;
+		list_move_tail(&pos->pmonr_deps_entry, &pmonr->pmonr_deps_head);
+		pos->ancestor_pmonr = pmonr;
+		old_summary.value = atomic64_read(&pos->prmid_summary_atomic);
+		summary.sched_rmid = prmid->rmid;
+		summary.read_rmid = old_summary.read_rmid;
+		atomic64_set(&pos->prmid_summary_atomic, summary.value);
+	}
+}
+
 static inline void
 __pmonr__ustate_to_astate(struct pmonr *pmonr, struct prmid *prmid)
 {
@@ -315,9 +382,59 @@ __pmonr__ustate_to_astate(struct pmonr *pmonr, struct prmid *prmid)
 	__pmonr__finish_to_astate(pmonr, prmid);
 }
 
+/*
+ * Find lowest active ancestor.
+ * Always successful since monr_hrchy_root is always in (A)state.
+ */
+static struct monr *
+__monr_hrchy__find_laa(struct monr *monr, u16 pkg_id)
+{
+	lockdep_assert_held(&cqm_pkgs_data[pkg_id]->pkg_data_lock);
+
+	while ((monr = monr->parent)) {
+		if (__pmonr__in_astate(monr->pmonrs[pkg_id]))
+			return monr;
+	}
+	/* Should have hitted monr_hrchy_root */
+	WARN_ON_ONCE(true);
+	return NULL;
+}
+
+/*
+ * __pmnor__move_dependants: Move dependants from one ancestor to another.
+ * @old: Old ancestor.
+ * @new: New ancestor.
+ *
+ * To be called on valid pmonrs. @new must be ancestor of @old.
+ */
+static inline void
+__pmonr__move_dependants(struct pmonr *old, struct pmonr *new)
+{
+	struct pmonr *dep;
+	union prmid_summary old_summary, summary;
+
+	WARN_ON_ONCE(old->pkg_id != new->pkg_id);
+	lockdep_assert_held(&__pkg_data(old, pkg_data_lock));
+
+	/* Update this pmonr dependencies to use new ancestor. */
+	list_for_each_entry(dep, &old->pmonr_deps_head, pmonr_deps_entry) {
+		/* Set next summary for dependent pmonrs. */
+		dep->ancestor_pmonr = new;
+
+		old_summary.value = atomic64_read(&dep->prmid_summary_atomic);
+		summary.sched_rmid = new->prmid->rmid;
+		summary.read_rmid = old_summary.read_rmid;
+		atomic64_set(&dep->prmid_summary_atomic, summary.value);
+	}
+	list_splice_tail_init(&old->pmonr_deps_head,
+			      &new->pmonr_deps_head);
+}
+
 static inline void
 __pmonr__to_ustate(struct pmonr *pmonr)
 {
+	struct pmonr *ancestor;
+	u16 pkg_id = pmonr->pkg_id;
 	union prmid_summary summary;
 
 	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
@@ -331,9 +448,27 @@ __pmonr__to_ustate(struct pmonr *pmonr)
 	if (__pmonr__in_astate(pmonr)) {
 		WARN_ON_ONCE(!pmonr->prmid);
 
+		ancestor = __monr_hrchy__find_laa(
+			pmonr->monr, pkg_id)->pmonrs[pkg_id];
+		WARN_ON_ONCE(!ancestor);
+		__pmonr__move_dependants(pmonr, ancestor);
 		list_move_tail(&pmonr->prmid->pool_entry,
 			       &__pkg_data(pmonr, nopmonr_limbo_prmids_pool));
 		pmonr->prmid =  NULL;
+	} else if (__pmonr__in_istate(pmonr)) {
+		list_del_init(&pmonr->pmonr_deps_entry);
+		/* limbo_prmid is already in limbo pool */
+		if (__pmonr__in_ilstate(pmonr)) {
+			WARN_ON(!pmonr->limbo_prmid);
+			list_move_tail(
+				&pmonr->limbo_prmid->pool_entry,
+				&__pkg_data(pmonr, nopmonr_limbo_prmids_pool));
+
+			pmonr->limbo_prmid = NULL;
+			list_del_init(&pmonr->limbo_rotation_entry);
+		} else {
+		}
+		pmonr->ancestor_pmonr = NULL;
 	} else {
 		WARN_ON_ONCE(true);
 		return;
@@ -346,6 +481,62 @@ __pmonr__to_ustate(struct pmonr *pmonr)
 
 	atomic64_set(&pmonr->prmid_summary_atomic, summary.value);
 	WARN_ON_ONCE(!__pmonr__in_ustate(pmonr));
+}
+
+static inline void __pmonr__set_istate_summary(struct pmonr *pmonr)
+{
+	union prmid_summary summary;
+
+	summary.sched_rmid = pmonr->ancestor_pmonr->prmid->rmid;
+	summary.read_rmid =
+		pmonr->limbo_prmid ? pmonr->limbo_prmid->rmid : INVALID_RMID;
+	atomic64_set(
+		&pmonr->prmid_summary_atomic, summary.value);
+}
+
+/*
+ * Transition to (I)state from no (I)state..
+ * Finds a valid ancestor transversing monr_hrchy. Cannot fail.
+ */
+static inline void
+__pmonr__to_istate(struct pmonr *pmonr)
+{
+	struct pmonr *ancestor;
+	u16 pkg_id = pmonr->pkg_id;
+
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+
+	if (!(__pmonr__in_ustate(pmonr) || __pmonr__in_astate(pmonr))) {
+		/* Invalid initial state. */
+		WARN_ON_ONCE(true);
+		return;
+	}
+
+	ancestor = __monr_hrchy__find_laa(pmonr->monr, pkg_id)->pmonrs[pkg_id];
+	WARN_ON_ONCE(!ancestor);
+
+	if (__pmonr__in_astate(pmonr)) {
+		/* Active pmonr->prmid becomes limbo in transition to (I)state.
+		 * Note that pmonr->prmid and pmonr->limbo_prmid are in an
+		 * union, so no need to copy.
+		 */
+		__pmonr__move_dependants(pmonr, ancestor);
+		list_move_tail(&pmonr->limbo_prmid->pool_entry,
+			       &__pkg_data(pmonr, pmonr_limbo_prmids_pool));
+	}
+
+	pmonr->ancestor_pmonr = ancestor;
+	list_add_tail(&pmonr->pmonr_deps_entry, &ancestor->pmonr_deps_head);
+
+	list_move_tail(
+		&pmonr->rotation_entry, &__pkg_data(pmonr, istate_pmonrs_lru));
+
+	if (pmonr->limbo_prmid)
+		list_move_tail(&pmonr->limbo_rotation_entry,
+			       &__pkg_data(pmonr, ilstate_pmonrs_lru));
+
+	__pmonr__set_istate_summary(pmonr);
+
 }
 
 static int intel_cqm_setup_pkg_prmid_pools(u16 pkg_id)
@@ -527,9 +718,9 @@ monr_hrchy_get_next_prmid_summary(struct pmonr *pmonr)
 
 	if (list_empty(&__pkg_data(pmonr, free_prmids_pool))) {
 		/* Failed to obtain an valid rmid in this package for this
-		 * monr. In next patches it will transition to (I)state.
-		 * For now, stay in (U)state (do nothing).
+		 * monr. Use an inherited one.
 		 */
+		__pmonr__to_istate(pmonr);
 	} else {
 		/* Transition to (A)state using free prmid. */
 		__pmonr__ustate_to_astate(
@@ -777,7 +968,7 @@ static int intel_cqm_event_add(struct perf_event *event, int mode)
 		__intel_cqm_event_start(event, summary);
 
 	/* (I)state pmonrs cannot report occupancy for themselves. */
-	return 0;
+	return prmid_summary__is_istate(summary) ? -1 : 0;
 }
 
 static inline bool cqm_group_leader(struct perf_event *event)

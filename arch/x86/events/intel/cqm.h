@@ -64,11 +64,11 @@ static inline int cqm_prmid_update(struct prmid *prmid);
  * The combination of values in sched_rmid and read_rmid indicate the state of
  * the associated pmonr (see pmonr comments) as follows:
  *					pmonr state
- *	      |	 (A)state	    (U)state
+ *	      |	 (A)state	  (IN)state	   (IL)state	    (U)state
  * ----------------------------------------------------------------------------
- * sched_rmid |	pmonr.prmid	   INVALID_RMID
- *  read_rmid |	pmonr.prmid	   INVALID_RMID
- *				      (or 0)
+ * sched_rmid |	pmonr.prmid	ancestor.prmid	ancestor.prmid	   INVALID_RMID
+ *  read_rmid |	pmonr.prmid	INVALID_RMID	pmonr.limbo_prmid  INVALID_RMID
+ *								      (or 0)
  *
  * The combination sched_rmid == INVALID_RMID and read_rmid == 0 for (U)state
  * denotes that the flag MONR_MON_ACTIVE is set in the monr associated with
@@ -90,6 +90,13 @@ inline bool prmid_summary__is_ustate(union prmid_summary summ)
 	return summ.sched_rmid == INVALID_RMID;
 }
 
+/* A pmonr in (I)state (either (IN)state or (IL)state. */
+inline bool prmid_summary__is_istate(union prmid_summary summ)
+{
+	return summ.sched_rmid != INVALID_RMID &&
+	       summ.sched_rmid != summ.read_rmid;
+}
+
 inline bool prmid_summary__is_mon_active(union prmid_summary summ)
 {
 	/* If not in (U)state, then MONR_MON_ACTIVE must be set. */
@@ -100,7 +107,24 @@ inline bool prmid_summary__is_mon_active(union prmid_summary summ)
 struct monr;
 
 /* struct pmonr: Node of per-package hierarchy of MONitored Resources.
+ * @ancestor_pmonr:		lowest active pmonr whose monr is ancestor of
+ *				this pmonr's monr.
+ * @pmonr_deps_head:		List of pmonrs without prmid that use
+ *				this pmonr's prmid -when in (A)state-.
  * @prmid:			The prmid of this pmonr -when in (A)state-.
+ * @pmonr_deps_entry:		Entry into ancestor's @pmonr_deps_head
+ *				-when inheriting, (I)state-.
+ * @limbo_prmid:		A prmid previously used by this pmonr and that
+ *				has not been reused yet and therefore contain
+ *				occupancy that should be counted towards this
+ *				pmonr's occupancy.
+ *				The limbo_prmid can be reused in the same pmonr
+ *				in the next transition to (A) state, even if
+ *				the occupancy of @limbo_prmid is not below the
+ *				dirty threshold, reducing the need of free
+ *				prmids.
+ * @limbo_rotation_entry:	List entry to attach to ilstate_pmonrs_lru when
+ *				this pmonr is in (IL)state.
  * @rotation_entry:		List entry to attach to pmonr rotation lists in
  *				pkg_data.
  * @monr:			The monr that contains this pmonr.
@@ -114,6 +138,15 @@ struct monr;
  * pmonr, the pmonr utilizes the rmid of its ancestor.
  * A pmonr is always in one of the following states:
  *   - (A)ctive:	Has @prmid assigned, @ancestor_pmonr must be NULL.
+ *   - (I)nherited:	The prmid used is "Inherited" from @ancestor_pmonr.
+ *			@ancestor_pmonr must be set. @prmid is unused. This is
+ *			a super-state composed of two substates:
+ *
+ *     - (IL)state:	A pmonr in (I)state that has a valid limbo_prmid.
+ *     - (IN)state:	A pmonr in (I)state with NO valid limbo_prmid.
+ *
+ *			When the distintion between the two substates is
+ *			no relevant, the pmonr is simply in the (I)state.
  *   - (U)nused:	No @ancestor_pmonr and no @prmid, hence no available
  *			prmid and no inhering one either. Not in rotation list.
  *			This state is unschedulable and a prmid
@@ -124,13 +157,41 @@ struct monr;
  * The state transitions are:
  *   (U) : The initial state. Starts there after allocation.
  *   (U) -> (A): If on first sched (or initialization) pmonr receives a prmid.
+ *   (U) -> (I): If on first sched (or initialization) pmonr cannot find a free
+ *               prmid and resort to use its ancestor's.
+ *   (A) -> (I): On stealing of prmid from pmonr (by rotation logic only).
  *   (A) -> (U): On destruction of monr.
+ *   (I) -> (A): On receiving a free prmid or on reuse of its @limbo_prmid (by
+ *		 rotation logic only).
+ *   (I) -> (U): On destruction of pmonr.
  *
- * Each pmonr is contained by a monr.
+ * Note that the (I) -> (A) transition makes monitoring available, but can
+ * introduce error due to cache lines allocated before the transition. Such
+ * error is likely to decrease over time.
+ * When entering an (I) state, the reported count of the event is unavaiable.
+ *
+ * Each pmonr is contained by a monr. Each monr forms a system-wide hierarchy
+ * that is used by the pmrs to find ancestors and dependants. The per-package
+ * hierarchy spanned by the pmrs follows the monr hierarchy except by
+ * collapsing the nodes in (I)state into a super-node that contains an (A)state
+ * pmonr and all of its dependants (pmonr in pmonr_deps_head).
  */
 struct pmonr {
 
-	struct prmid				*prmid;
+	/* If set, pmonr is in (I)state. */
+	struct pmonr				*ancestor_pmonr;
+
+	union{
+		struct { /* (A)state variables. */
+			struct list_head	pmonr_deps_head;
+			struct prmid		*prmid;
+		};
+		struct { /* (I)state variables. */
+			struct list_head	pmonr_deps_entry;
+			struct prmid		*limbo_prmid;
+			struct list_head	limbo_rotation_entry;
+		};
+	};
 
 	struct monr				*monr;
 	struct list_head			rotation_entry;
@@ -148,10 +209,17 @@ struct pmonr {
  *				XXX: Make it an array of prmids.
  * @free_prmid_pool:		Free prmids.
  * @active_prmid_pool:		prmids associated with a (A)state pmonr.
+ * @pmonr_limbo_prmid_pool:	limbo prmids referenced by the limbo_prmid of a
+ *				pmonr in (I)state.
  * @nopmonr_limbo_prmid_pool:	prmids in limbo state that are not referenced
  *				by a pmonr.
  * @astate_pmonrs_lru:		pmonrs in (A)state. LRU in increasing order of
  *				pmonr.last_enter_astate.
+ * @istate_pmonrs_lru:		pmors In (I)state with no limbo_prmid. LRU in
+ *				increasing order of pmonr.last_enter_istate.
+ * @ilsate_pmonrs_lru:		pmonrs in (IL)state, these pmonrs have a valid
+ *				limbo_prmid. It's a subset of istate_pmonrs_lru.
+ *				Sorted increasingly by pmonr.last_enter_istate.
  * @pkg_data_mutex:		Hold for stability when modifying pmonrs
  *				hierarchy.
  * @pkg_data_lock:		Hold to protect variables that may be accessed
@@ -173,9 +241,13 @@ struct pkg_data {
 	/* Can be modified during task switch with (U)state -> (A)state. */
 	struct list_head	active_prmids_pool;
 	/* Only modified during rotation logic and deletion. */
+	struct list_head	pmonr_limbo_prmids_pool;
 	struct list_head	nopmonr_limbo_prmids_pool;
 
 	struct list_head	astate_pmonrs_lru;
+	/* Superset of ilstate_pmonrs_lru. */
+	struct list_head	istate_pmonrs_lru;
+	struct list_head	ilstate_pmonrs_lru;
 
 	struct mutex		pkg_data_mutex;
 	raw_spinlock_t		pkg_data_lock;
