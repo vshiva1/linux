@@ -3349,15 +3349,28 @@ static void __perf_event_read(void *info)
 	struct perf_event_context *ctx = event->ctx;
 	struct perf_cpu_context *cpuctx = __get_cpu_context(ctx);
 	struct pmu *pmu = event->pmu;
+	bool read_inactive = __perf_can_read_inactive(event);
+
+	WARN_ON_ONCE(event->cpu == -1 &&
+		(event->pmu_event_flags & PERF_INACTIVE_CPU_READ_PKG));
+
+	/* If inactive, we should be reading in the adequate package. */
+	WARN_ON_ONCE(
+		event->state != PERF_EVENT_STATE_ACTIVE &&
+		(event->pmu_event_flags & PERF_INACTIVE_CPU_READ_PKG) &&
+		(topology_physical_package_id(event->cpu) !=
+			topology_physical_package_id(smp_processor_id())));
 
 	/*
 	 * If this is a task context, we need to check whether it is
-	 * the current task context of this cpu.  If not it has been
+	 * the current task context of this cpu or if the event
+	 * can be read while inactive.  If cannot read while inactive
+	 * and not in current cpu, then the event has been
 	 * scheduled out before the smp call arrived.  In that case
 	 * event->count would have been updated to a recent sample
 	 * when the event was scheduled out.
 	 */
-	if (ctx->task && cpuctx->task_ctx != ctx)
+	if (ctx->task && cpuctx->task_ctx != ctx && !read_inactive)
 		return;
 
 	raw_spin_lock(&ctx->lock);
@@ -3367,8 +3380,10 @@ static void __perf_event_read(void *info)
 	}
 
 	update_event_times(event);
-	if (event->state != PERF_EVENT_STATE_ACTIVE)
+
+	if (event->state != PERF_EVENT_STATE_ACTIVE && !read_inactive)
 		goto unlock;
+
 
 	if (!data->group) {
 		pmu->read(event);
@@ -3382,7 +3397,8 @@ static void __perf_event_read(void *info)
 
 	list_for_each_entry(sub, &event->sibling_list, group_entry) {
 		update_event_times(sub);
-		if (sub->state == PERF_EVENT_STATE_ACTIVE) {
+		if (sub->state == PERF_EVENT_STATE_ACTIVE ||
+		    __perf_can_read_inactive(sub)) {
 			/*
 			 * Use sibling's PMU rather than @event's since
 			 * sibling could be on different (eg: software) PMU.
@@ -3451,19 +3467,34 @@ u64 perf_event_read_local(struct perf_event *event)
 static int perf_event_read(struct perf_event *event, bool group)
 {
 	int ret = 0;
+	bool active = event->state == PERF_EVENT_STATE_ACTIVE;
 
 	/*
-	 * If event is enabled and currently active on a CPU, update the
-	 * value in the event structure:
+	 * Read inactive event if  PMU allows it. Otherwise, if event is
+	 * enabled and currently active on a CPU, update the value in the
+	 * event structure:
 	 */
-	if (event->state == PERF_EVENT_STATE_ACTIVE) {
+
+	if (active || __perf_can_read_inactive(event)) {
 		struct perf_read_data data = {
 			.event = event,
 			.group = group,
 			.ret = 0,
 		};
-		smp_call_function_single(event->oncpu,
-					 __perf_event_read, &data, 1);
+		int cpu_to_read = event->oncpu;
+
+		if (!active) {
+			cpu_to_read =
+				/* if __perf_can_read_inactive is true, it
+				 * either is a CPU/cgroup event or can be
+				 * read for any CPU.
+				 */
+				(event->pmu_event_flags &
+				       PERF_INACTIVE_EV_READ_ANY_CPU) ?
+				smp_processor_id() : event->cpu;
+		}
+		smp_call_function_single(
+			cpu_to_read, __perf_event_read, &data, 1);
 		ret = data.ret;
 	} else if (event->state == PERF_EVENT_STATE_INACTIVE) {
 		struct perf_event_context *ctx = event->ctx;

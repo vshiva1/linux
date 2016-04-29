@@ -685,6 +685,23 @@ struct perf_event {
 /* Do not enable cgroup events in descendant cgroups. */
 #define PERF_CGROUP_NO_RECURSION	(1 << 0)
 
+/* CPU Event can read from event::cpu's package even if not in
+ * PERF_EVENT_STATE_ACTIVE, event::cpu must be a valid CPU.
+ */
+#define PERF_INACTIVE_CPU_READ_PKG	(1 << 1)
+
+/* Event can read from any package even if not in PERF_EVENT_STATE_ACTIVE. */
+#define PERF_INACTIVE_EV_READ_ANY_CPU	(1 << 2)
+
+#ifdef CONFIG_PERF_EVENTS
+static inline bool __perf_can_read_inactive(struct perf_event *event)
+{
+	return (event->pmu_event_flags & PERF_INACTIVE_EV_READ_ANY_CPU) ||
+		((event->pmu_event_flags & PERF_INACTIVE_CPU_READ_PKG) &&
+		(event->cpu != -1));
+}
+#endif
+
 /**
  * struct perf_event_context - event context structure
  *
