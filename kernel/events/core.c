@@ -10449,6 +10449,7 @@ static struct cgroup_subsys_state *
 perf_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 {
 	struct perf_cgroup *jc;
+	int ret;
 
 	jc = kzalloc(sizeof(*jc), GFP_KERNEL);
 	if (!jc)
@@ -10460,12 +10461,35 @@ perf_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 		return ERR_PTR(-ENOMEM);
 	}
 
+	jc->arch_info = NULL;
+
+	ret = perf_cgroup_arch_css_alloc(parent_css, &jc->css);
+	if (ret)
+		return ERR_PTR(ret);
+
 	return &jc->css;
+}
+
+static int perf_cgroup_css_online(struct cgroup_subsys_state *css)
+{
+	return perf_cgroup_arch_css_online(css);
+}
+
+static void perf_cgroup_css_offline(struct cgroup_subsys_state *css)
+{
+	perf_cgroup_arch_css_offline(css);
+}
+
+static void perf_cgroup_css_released(struct cgroup_subsys_state *css)
+{
+	perf_cgroup_arch_css_released(css);
 }
 
 static void perf_cgroup_css_free(struct cgroup_subsys_state *css)
 {
 	struct perf_cgroup *jc = container_of(css, struct perf_cgroup, css);
+
+	perf_cgroup_arch_css_free(css);
 
 	free_percpu(jc->info);
 	kfree(jc);
@@ -10491,6 +10515,9 @@ static void perf_cgroup_attach(struct cgroup_taskset *tset)
 
 struct cgroup_subsys perf_event_cgrp_subsys = {
 	.css_alloc	= perf_cgroup_css_alloc,
+	.css_online	= perf_cgroup_css_online,
+	.css_offline	= perf_cgroup_css_offline,
+	.css_released	= perf_cgroup_css_released,
 	.css_free	= perf_cgroup_css_free,
 	.attach		= perf_cgroup_attach,
 };

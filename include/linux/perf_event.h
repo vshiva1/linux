@@ -768,7 +768,9 @@ struct perf_cgroup_info {
 };
 
 struct perf_cgroup {
-	struct cgroup_subsys_state	css;
+	/* Architecture specific information. */
+	void				 *arch_info;
+	struct cgroup_subsys_state	 css;
 	struct perf_cgroup_info	__percpu *info;
 };
 
@@ -1330,5 +1332,29 @@ _name##_show(struct device *dev,					\
 }									\
 									\
 static struct device_attribute format_attr_##_name = __ATTR_RO(_name)
+
+
+/*
+ * Hooks for architecture specific extensions for perf_cgroup.
+ */
+#ifndef perf_cgroup_arch_css_alloc
+# define perf_cgroup_arch_css_alloc(parent_css, new_css) 0
+#endif
+
+#ifndef perf_cgroup_arch_css_online
+# define perf_cgroup_arch_css_online(css) 0
+#endif
+
+#ifndef perf_cgroup_arch_css_offline
+# define perf_cgroup_arch_css_offline(css) do { } while (0)
+#endif
+
+#ifndef perf_cgroup_arch_css_released
+# define perf_cgroup_arch_css_released(css) do { } while (0)
+#endif
+
+#ifndef perf_cgroup_arch_css_free
+# define perf_cgroup_arch_css_free(css) do { } while (0)
+#endif
 
 #endif /* _LINUX_PERF_EVENT_H */
