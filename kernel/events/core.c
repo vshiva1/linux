@@ -3863,6 +3863,8 @@ static void _free_event(struct perf_event *event)
 		ring_buffer_attach(event, NULL);
 		mutex_unlock(&event->mmap_mutex);
 	}
+	if (event->pmu->event_terminate)
+		event->pmu->event_terminate(event);
 
 	if (is_cgroup_event(event))
 		perf_detach_cgroup(event);
@@ -8919,6 +8921,8 @@ err_per_task:
 	exclusive_event_destroy(event);
 
 err_pmu:
+	if (event->pmu->event_terminate)
+		event->pmu->event_terminate(event);
 	if (event->destroy)
 		event->destroy(event);
 	module_put(pmu->module);

@@ -2376,7 +2376,7 @@ static inline bool cqm_group_leader(struct perf_event *event)
 	return !list_empty(&event->hw.cqm_event_groups_entry);
 }
 
-static void intel_cqm_event_destroy(struct perf_event *event)
+static void intel_cqm_event_terminate(struct perf_event *event)
 {
 	struct perf_event *group_other = NULL;
 	struct monr *monr;
@@ -2423,6 +2423,19 @@ static void intel_cqm_event_destroy(struct perf_event *event)
 	if (monr__is_root(monr))
 		goto exit;
 
+#ifdef CONFIG_CGROUP_PERF
+	/* Handle cgroup event. */
+	if (event->cgrp) {
+		monr->mon_event_group = NULL;
+		if ((event->cgrp->css.flags & CSS_ONLINE) &&
+		    !cgrp_to_cqm_info(event->cgrp)->cont_monitoring)
+			__css_stop_monitoring(&monr__get_mon_cgrp(monr)->css);
+
+		goto exit;
+	}
+	WARN_ON_ONCE(!monr_is_event_type(monr));
+#endif
+
 	/* Transition all pmonrs to (U)state. */
 	monr_hrchy_acquire_locks(flags, i);
 
@@ -2462,8 +2475,6 @@ static int intel_cqm_event_init(struct perf_event *event)
 
 	INIT_LIST_HEAD(&event->hw.cqm_event_groups_entry);
 	INIT_LIST_HEAD(&event->hw.cqm_event_group_entry);
-
-	event->destroy = intel_cqm_event_destroy;
 
 	mutex_lock(&cqm_mutex);
 
@@ -2580,6 +2591,7 @@ static struct pmu intel_cqm_pmu = {
 	.attr_groups	     = intel_cqm_attr_groups,
 	.task_ctx_nr	     = perf_sw_context,
 	.event_init	     = intel_cqm_event_init,
+	.event_terminate     = intel_cqm_event_terminate,
 	.add		     = intel_cqm_event_add,
 	.del		     = intel_cqm_event_stop,
 	.start		     = intel_cqm_event_start,

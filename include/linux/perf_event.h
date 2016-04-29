@@ -278,6 +278,12 @@ struct pmu {
 	int (*event_init)		(struct perf_event *event);
 
 	/*
+	 * Terminate the event for this PMU. Optional complement for a
+	 * successful event_init. Called before the event fields are tear down.
+	 */
+	void (*event_terminate)		(struct perf_event *event);
+
+	/*
 	 * Notification that the event was mapped or unmapped.  Called
 	 * in the context of the mapping task.
 	 */
