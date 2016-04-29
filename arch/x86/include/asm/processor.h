@@ -22,6 +22,7 @@ struct vm86;
 #include <asm/nops.h>
 #include <asm/special_insns.h>
 #include <asm/fpu/types.h>
+#include <asm/pqr_common.h>
 
 #include <linux/personality.h>
 #include <linux/cache.h>
