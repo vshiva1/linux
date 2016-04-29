@@ -1123,9 +1123,10 @@ static void arm_ccn_pmu_event_del(struct perf_event *event, int flags)
 	arm_ccn_pmu_event_release(event);
 }
 
-static void arm_ccn_pmu_event_read(struct perf_event *event)
+static int arm_ccn_pmu_event_read(struct perf_event *event)
 {
 	arm_ccn_pmu_event_update(event);
+	return 0;
 }
 
 static irqreturn_t arm_ccn_pmu_overflow_handler(struct arm_ccn_dt *dt)

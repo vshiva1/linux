@@ -1771,9 +1771,10 @@ static int __init init_hw_perf_events(void)
 }
 early_initcall(init_hw_perf_events);
 
-static inline void x86_pmu_read(struct perf_event *event)
+static inline int x86_pmu_read(struct perf_event *event)
 {
 	x86_perf_event_update(event);
+	return 0;
 }
 
 /*

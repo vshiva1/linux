@@ -71,7 +71,7 @@ static struct amd_uncore *event_to_amd_uncore(struct perf_event *event)
 	return NULL;
 }
 
-static void amd_uncore_read(struct perf_event *event)
+static int amd_uncore_read(struct perf_event *event)
 {
 	struct hw_perf_event *hwc = &event->hw;
 	u64 prev, new;
@@ -88,6 +88,7 @@ static void amd_uncore_read(struct perf_event *event)
 	delta = (new << COUNTER_SHIFT) - (prev << COUNTER_SHIFT);
 	delta >>= COUNTER_SHIFT;
 	local64_add(delta, &event->count);
+	return 0;
 }
 
 static void amd_uncore_start(struct perf_event *event, int flags)

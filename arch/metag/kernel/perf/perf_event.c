@@ -360,15 +360,16 @@ static void metag_pmu_del(struct perf_event *event, int flags)
 	perf_event_update_userpage(event);
 }
 
-static void metag_pmu_read(struct perf_event *event)
+static int metag_pmu_read(struct perf_event *event)
 {
 	struct hw_perf_event *hwc = &event->hw;
 
 	/* Don't read disabled counters! */
 	if (hwc->idx < 0)
-		return;
+		return 0;
 
 	metag_pmu_event_update(event, hwc, hwc->idx);
+	return 0;
 }
 
 static struct pmu pmu = {

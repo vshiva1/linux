@@ -2443,7 +2443,7 @@ exit_error:
 }
 
 /* Read current package immediately and remote pkg (if any) from cache. */
-static void __read_task_event(struct perf_event *event)
+static int __read_task_event(struct perf_event *event)
 {
 	int i, ret;
 	u64 count = 0;
@@ -2458,26 +2458,31 @@ static void __read_task_event(struct perf_event *event)
 
 		ret = pmonr__get_read_rmid(pmonr, &rmid, true);
 		if (ret)
-			return;
+			return ret;
 		if (rmid == INVALID_RMID)
 			continue;
 		prmid = __prmid_from_rmid(i, rmid);
 		if (WARN_ON_ONCE(!prmid))
-			return;
+			return -1;
 
 		/* update and read local for this cpu's package. */
-		if (i == pkg_id)
-			cqm_prmid_update(prmid);
+		if (i == pkg_id) {
+			ret = cqm_prmid_update(prmid);
+			if (ret < 0)
+				return ret;
+		}
 		count += atomic64_read(&prmid->last_read_value);
 	}
 	local64_set(&event->count, count);
+	return 0;
 }
 
 /* Read current package immediately and remote pkg (if any) from cache. */
-static void intel_cqm_event_read(struct perf_event *event)
+static int intel_cqm_event_read(struct perf_event *event)
 {
 	struct monr *monr;
 	u64 count;
+	int ret;
 	u16 pkg_id = topology_physical_package_id(smp_processor_id());
 
 	monr = monr_from_event(event);
@@ -2490,23 +2495,24 @@ static void intel_cqm_event_read(struct perf_event *event)
 	 */
 	if (event->parent) {
 		local64_set(&event->count, 0);
-		return;
+		return 0;
 	}
 
 	if (event->attach_state & PERF_ATTACH_TASK) {
-		__read_task_event(event);
-		return;
+		return __read_task_event(event);
 	}
 
 	/* It's either a cgroup or a cpu event. */
 	if (WARN_ON_ONCE(event->cpu < 0))
-		return;
+		return -1;
 
 	/* XXX: expose fail_on_inh_descendant as a configuration parameter? */
-	pmonr__read_subtree(monr, pkg_id, &count, false);
+	ret =  pmonr__read_subtree(monr, pkg_id, &count, false);
+	if (ret < 0)
+		return ret;
 
 	local64_set(&event->count, count);
-	return;
+	return 0;
 }
 
 static inline void __intel_cqm_event_start(

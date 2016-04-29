@@ -191,12 +191,13 @@ static u64 h_gpci_get_value(struct perf_event *event)
 	return count;
 }
 
-static void h_gpci_event_update(struct perf_event *event)
+static int h_gpci_event_update(struct perf_event *event)
 {
 	s64 prev;
 	u64 now = h_gpci_get_value(event);
 	prev = local64_xchg(&event->hw.prev_count, now);
 	local64_add(now - prev, &event->count);
+	return 0;
 }
 
 static void h_gpci_event_start(struct perf_event *event, int flags)

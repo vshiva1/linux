@@ -39,12 +39,14 @@ static inline u64 pmc_bitmask(struct kvm_pmc *pmc)
 
 static inline u64 pmc_read_counter(struct kvm_pmc *pmc)
 {
-	u64 counter, enabled, running;
+	u64 counter, counter_tmp, enabled, running;
 
 	counter = pmc->counter;
-	if (pmc->perf_event)
-		counter += perf_event_read_value(pmc->perf_event,
-						 &enabled, &running);
+	if (pmc->perf_event) {
+		if (!perf_event_read_value(pmc->perf_event, &counter_tmp,
+					   &enabled, &running))
+			counter += counter_tmp;
+	}
 	/* FIXME: Scaling needed? */
 	return counter & pmc_bitmask(pmc);
 }

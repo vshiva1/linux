@@ -176,12 +176,12 @@ static void write_pmlcb(int idx, unsigned long val)
 	isync();
 }
 
-static void fsl_emb_pmu_read(struct perf_event *event)
+static int fsl_emb_pmu_read(struct perf_event *event)
 {
 	s64 val, delta, prev;
 
 	if (event->hw.state & PERF_HES_STOPPED)
-		return;
+		return 0;
 
 	/*
 	 * Performance monitor interrupts come even when interrupts
@@ -198,6 +198,7 @@ static void fsl_emb_pmu_read(struct perf_event *event)
 	delta = (val - prev) & 0xfffffffful;
 	local64_add(delta, &event->count);
 	local64_sub(delta, &event->hw.period_left);
+	return 0;
 }
 
 /*

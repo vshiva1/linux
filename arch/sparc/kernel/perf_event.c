@@ -1131,7 +1131,7 @@ static void sparc_pmu_del(struct perf_event *event, int _flags)
 	local_irq_restore(flags);
 }
 
-static void sparc_pmu_read(struct perf_event *event)
+static int sparc_pmu_read(struct perf_event *event)
 {
 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
 	int idx = active_event_index(cpuc, event);

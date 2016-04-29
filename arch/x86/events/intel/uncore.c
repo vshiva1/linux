@@ -577,10 +577,11 @@ static void uncore_pmu_event_del(struct perf_event *event, int flags)
 	event->hw.last_tag = ~0ULL;
 }
 
-void uncore_pmu_event_read(struct perf_event *event)
+int uncore_pmu_event_read(struct perf_event *event)
 {
 	struct intel_uncore_box *box = uncore_event_to_box(event);
 	uncore_perf_event_update(box, event);
+	return 0;
 }
 
 /*

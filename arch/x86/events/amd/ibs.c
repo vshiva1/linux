@@ -510,7 +510,7 @@ static void perf_ibs_del(struct perf_event *event, int flags)
 	perf_event_update_userpage(event);
 }
 
-static void perf_ibs_read(struct perf_event *event) { }
+static int perf_ibs_read(struct perf_event *event) { return 0; }
 
 PMU_FORMAT_ATTR(rand_en,	"config:57");
 PMU_FORMAT_ATTR(cnt_ctl,	"config:19");

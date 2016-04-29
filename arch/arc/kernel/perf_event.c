@@ -116,9 +116,10 @@ static void arc_perf_event_update(struct perf_event *event,
 	local64_sub(delta, &hwc->period_left);
 }
 
-static void arc_pmu_read(struct perf_event *event)
+static int arc_pmu_read(struct perf_event *event)
 {
 	arc_perf_event_update(event, &event->hw, event->hw.idx);
+	return 0;
 }
 
 static int arc_pmu_cache_event(u64 config)

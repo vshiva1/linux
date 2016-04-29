@@ -408,9 +408,10 @@ static int rapl_pmu_event_init(struct perf_event *event)
 	return ret;
 }
 
-static void rapl_pmu_event_read(struct perf_event *event)
+static int rapl_pmu_event_read(struct perf_event *event)
 {
 	rapl_event_update(event);
+	return 0;
 }
 
 static ssize_t rapl_get_attr_cpumask(struct device *dev,

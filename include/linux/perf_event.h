@@ -346,7 +346,7 @@ struct pmu {
 	 * For sampling capable PMUs this will also update the software period
 	 * hw_perf_event::period_left field.
 	 */
-	void (*read)			(struct perf_event *event);
+	int (*read)			(struct perf_event *event);
 
 	/*
 	 * Group events scheduling is treated as a transaction, add
@@ -866,8 +866,8 @@ perf_event_create_kernel_counter(struct perf_event_attr *attr,
 extern void perf_pmu_migrate_context(struct pmu *pmu,
 				int src_cpu, int dst_cpu);
 extern u64 perf_event_read_local(struct perf_event *event);
-extern u64 perf_event_read_value(struct perf_event *event,
-				 u64 *enabled, u64 *running);
+extern int perf_event_read_value(struct perf_event *event,
+				 u64 *total, u64 *enabled, u64 *running);
 
 
 struct perf_sample_data {

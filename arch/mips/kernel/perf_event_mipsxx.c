@@ -509,7 +509,7 @@ static void mipspmu_del(struct perf_event *event, int flags)
 	perf_event_update_userpage(event);
 }
 
-static void mipspmu_read(struct perf_event *event)
+static int mipspmu_read(struct perf_event *event)
 {
 	struct hw_perf_event *hwc = &event->hw;
 
@@ -518,6 +518,7 @@ static void mipspmu_read(struct perf_event *event)
 		return;
 
 	mipspmu_event_update(event, hwc, hwc->idx);
+	return 0;
 }
 
 static void mipspmu_enable(struct pmu *pmu)

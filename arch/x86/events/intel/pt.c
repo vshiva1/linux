@@ -1324,8 +1324,9 @@ fail:
 	return ret;
 }
 
-static void pt_event_read(struct perf_event *event)
+static int pt_event_read(struct perf_event *event)
 {
+	return 0;
 }
 
 static void pt_event_destroy(struct perf_event *event)

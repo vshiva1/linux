@@ -1033,9 +1033,10 @@ static u64 pmu_event_update(struct perf_event *event)
 	return new_raw_count;
 }
 
-static void pmu_read(struct perf_event *event)
+static int pmu_read(struct perf_event *event)
 {
 	pmu_event_update(event);
+	return 0;
 }
 
 static void pmu_event_set_period(struct perf_event *event)

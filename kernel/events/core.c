@@ -2632,7 +2632,7 @@ static void __perf_event_sync_stat(struct perf_event *event,
 	 */
 	switch (event->state) {
 	case PERF_EVENT_STATE_ACTIVE:
-		event->pmu->read(event);
+		(void)event->pmu->read(event);
 		/* fall-through */
 
 	case PERF_EVENT_STATE_INACTIVE:
@@ -3374,6 +3374,7 @@ static void __perf_event_read(void *info)
 		return;
 
 	raw_spin_lock(&ctx->lock);
+
 	if (ctx->is_active) {
 		update_context_time(ctx);
 		update_cgrp_time_from_event(event);
@@ -3386,14 +3387,15 @@ static void __perf_event_read(void *info)
 
 
 	if (!data->group) {
-		pmu->read(event);
-		data->ret = 0;
+		data->ret = pmu->read(event);
 		goto unlock;
 	}
 
 	pmu->start_txn(pmu, PERF_PMU_TXN_READ);
 
-	pmu->read(event);
+	data->ret = pmu->read(event);
+	if (data->ret)
+		goto unlock;
 
 	list_for_each_entry(sub, &event->sibling_list, group_entry) {
 		update_event_times(sub);
@@ -3403,7 +3405,9 @@ static void __perf_event_read(void *info)
 			 * Use sibling's PMU rather than @event's since
 			 * sibling could be on different (eg: software) PMU.
 			 */
-			sub->pmu->read(sub);
+			data->ret = sub->pmu->read(sub);
+			if (data->ret)
+				goto unlock;
 		}
 	}
 
@@ -3424,6 +3428,7 @@ static inline u64 perf_event_count(struct perf_event *event)
  *   - either for the current task, or for this CPU
  *   - does not have inherit set, for inherited task events
  *     will not be local and we cannot read them atomically
+ *   - pmu::read cannot fail
  */
 u64 perf_event_read_local(struct perf_event *event)
 {
@@ -3456,7 +3461,7 @@ u64 perf_event_read_local(struct perf_event *event)
 	 * oncpu == -1).
 	 */
 	if (event->oncpu == smp_processor_id())
-		event->pmu->read(event);
+		(void) event->pmu->read(event);
 
 	val = local64_read(&event->count);
 	local_irq_restore(flags);
@@ -3493,8 +3498,12 @@ static int perf_event_read(struct perf_event *event, bool group)
 				       PERF_INACTIVE_EV_READ_ANY_CPU) ?
 				smp_processor_id() : event->cpu;
 		}
-		smp_call_function_single(
-			cpu_to_read, __perf_event_read, &data, 1);
+		ret = smp_call_function_single(cpu_to_read,
+					       __perf_event_read, &data, 1);
+		if (ret) {
+			WARN_ON_ONCE(ret);
+			return ret;
+		}
 		ret = data.ret;
 	} else if (event->state == PERF_EVENT_STATE_INACTIVE) {
 		struct perf_event_context *ctx = event->ctx;
@@ -3516,7 +3525,6 @@ static int perf_event_read(struct perf_event *event, bool group)
 			update_event_times(event);
 		raw_spin_unlock_irqrestore(&ctx->lock, flags);
 	}
-
 	return ret;
 }
 
@@ -4113,18 +4121,22 @@ static int perf_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-u64 perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *running)
+int perf_event_read_value(struct perf_event *event,
+			  u64 *total, u64 *enabled, u64 *running)
 {
 	struct perf_event *child;
-	u64 total = 0;
 
+	int ret;
+	*total = 0;
 	*enabled = 0;
 	*running = 0;
 
 	mutex_lock(&event->child_mutex);
 
-	(void)perf_event_read(event, false);
-	total += perf_event_count(event);
+	ret = perf_event_read(event, false);
+	if (ret)
+		goto exit;
+	*total += perf_event_count(event);
 
 	*enabled += event->total_time_enabled +
 			atomic64_read(&event->child_total_time_enabled);
@@ -4132,14 +4144,17 @@ u64 perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *running)
 			atomic64_read(&event->child_total_time_running);
 
 	list_for_each_entry(child, &event->child_list, child_list) {
-		(void)perf_event_read(child, false);
-		total += perf_event_count(child);
+		ret = perf_event_read(child, false);
+		if (ret)
+			goto exit;
+		*total += perf_event_count(child);
 		*enabled += child->total_time_enabled;
 		*running += child->total_time_running;
 	}
+exit:
 	mutex_unlock(&event->child_mutex);
 
-	return total;
+	return ret;
 }
 EXPORT_SYMBOL_GPL(perf_event_read_value);
 
@@ -4236,9 +4251,11 @@ static int perf_read_one(struct perf_event *event,
 {
 	u64 enabled, running;
 	u64 values[4];
-	int n = 0;
+	int n = 0, ret;
 
-	values[n++] = perf_event_read_value(event, &enabled, &running);
+	ret = perf_event_read_value(event, &values[n++], &enabled, &running);
+	if (ret)
+		return ret;
 	if (read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
 		values[n++] = enabled;
 	if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
@@ -5505,7 +5522,7 @@ static void perf_output_read_group(struct perf_output_handle *handle,
 		values[n++] = running;
 
 	if (leader != event)
-		leader->pmu->read(leader);
+		(void)leader->pmu->read(leader);
 
 	values[n++] = perf_event_count(leader);
 	if (read_format & PERF_FORMAT_ID)
@@ -5518,7 +5535,7 @@ static void perf_output_read_group(struct perf_output_handle *handle,
 
 		if ((sub != event) &&
 		    (sub->state == PERF_EVENT_STATE_ACTIVE))
-			sub->pmu->read(sub);
+			(void)sub->pmu->read(sub);
 
 		values[n++] = perf_event_count(sub);
 		if (read_format & PERF_FORMAT_ID)
@@ -7193,8 +7210,9 @@ fail:
 	preempt_enable_notrace();
 }
 
-static void perf_swevent_read(struct perf_event *event)
+static int perf_swevent_read(struct perf_event *event)
 {
+	return 0;
 }
 
 static int perf_swevent_add(struct perf_event *event, int flags)
@@ -7992,7 +8010,7 @@ static enum hrtimer_restart perf_swevent_hrtimer(struct hrtimer *hrtimer)
 	if (event->state != PERF_EVENT_STATE_ACTIVE)
 		return HRTIMER_NORESTART;
 
-	event->pmu->read(event);
+	(void)event->pmu->read(event);
 
 	perf_sample_data_init(&data, 0, event->hw.last_period);
 	regs = get_irq_regs();
@@ -8107,9 +8125,10 @@ static void cpu_clock_event_del(struct perf_event *event, int flags)
 	cpu_clock_event_stop(event, flags);
 }
 
-static void cpu_clock_event_read(struct perf_event *event)
+static int cpu_clock_event_read(struct perf_event *event)
 {
 	cpu_clock_event_update(event);
+	return 0;
 }
 
 static int cpu_clock_event_init(struct perf_event *event)
@@ -8184,13 +8203,14 @@ static void task_clock_event_del(struct perf_event *event, int flags)
 	task_clock_event_stop(event, PERF_EF_UPDATE);
 }
 
-static void task_clock_event_read(struct perf_event *event)
+static int task_clock_event_read(struct perf_event *event)
 {
 	u64 now = perf_clock();
 	u64 delta = now - event->ctx->timestamp;
 	u64 time = event->ctx->time + delta;
 
 	task_clock_event_update(event, time);
+	return 0;
 }
 
 static int task_clock_event_init(struct perf_event *event)

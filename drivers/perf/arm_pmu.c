@@ -163,10 +163,11 @@ again:
 	return new_raw_count;
 }
 
-static void
+static int
 armpmu_read(struct perf_event *event)
 {
 	armpmu_event_update(event);
+	return 0;
 }
 
 static void

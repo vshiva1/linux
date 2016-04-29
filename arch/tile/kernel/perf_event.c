@@ -734,9 +734,10 @@ static void tile_pmu_del(struct perf_event *event, int flags)
 /*
  * Propagate event elapsed time into the event.
  */
-static inline void tile_pmu_read(struct perf_event *event)
+static inline int tile_pmu_read(struct perf_event *event)
 {
 	tile_perf_event_update(event);
+	return 0;
 }
 
 /*

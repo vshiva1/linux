@@ -471,12 +471,13 @@ out:
 	return err;
 }
 
-static void cpumf_pmu_read(struct perf_event *event)
+static int cpumf_pmu_read(struct perf_event *event)
 {
 	if (event->hw.state & PERF_HES_STOPPED)
-		return;
+		return 0;
 
 	hw_perf_event_update(event);
+	return 0;
 }
 
 static void cpumf_pmu_start(struct perf_event *event, int flags)

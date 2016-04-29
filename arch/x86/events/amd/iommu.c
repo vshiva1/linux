@@ -317,7 +317,7 @@ static void perf_iommu_start(struct perf_event *event, int flags)
 
 }
 
-static void perf_iommu_read(struct perf_event *event)
+static int perf_iommu_read(struct perf_event *event)
 {
 	u64 count = 0ULL;
 	u64 prev_raw_count = 0ULL;
@@ -335,13 +335,14 @@ static void perf_iommu_read(struct perf_event *event)
 	prev_raw_count =  local64_read(&hwc->prev_count);
 	if (local64_cmpxchg(&hwc->prev_count, prev_raw_count,
 					count) != prev_raw_count)
-		return;
+		return 0;
 
 	/* Handling 48-bit counter overflowing */
 	delta = (count << COUNTER_SHIFT) - (prev_raw_count << COUNTER_SHIFT);
 	delta >>= COUNTER_SHIFT;
 	local64_add(delta, &event->count);
 
+	return 0;
 }
 
 static void perf_iommu_stop(struct perf_event *event, int flags)

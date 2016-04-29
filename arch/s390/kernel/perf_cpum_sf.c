@@ -1298,9 +1298,10 @@ static void hw_perf_event_update(struct perf_event *event, int flush_all)
 				    sampl_overflow, event_overflow);
 }
 
-static void cpumsf_pmu_read(struct perf_event *event)
+static int cpumsf_pmu_read(struct perf_event *event)
 {
 	/* Nothing to do ... updates are interrupt-driven */
+	return 0;
 }
 
 /* Activate sampling control.

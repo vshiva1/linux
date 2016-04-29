@@ -401,9 +401,10 @@ int __kprobes hw_breakpoint_exceptions_notify(struct notifier_block *unused,
 	return hw_breakpoint_handler(data);
 }
 
-void hw_breakpoint_pmu_read(struct perf_event *bp)
+int hw_breakpoint_pmu_read(struct perf_event *bp)
 {
 	/* TODO */
+	return 0;
 }
 
 int register_sh_ubc(struct sh_ubc *ubc)

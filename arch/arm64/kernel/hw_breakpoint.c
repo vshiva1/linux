@@ -942,8 +942,9 @@ static int __init arch_hw_breakpoint_init(void)
 }
 arch_initcall(arch_hw_breakpoint_init);
 
-void hw_breakpoint_pmu_read(struct perf_event *bp)
+int hw_breakpoint_pmu_read(struct perf_event *bp)
 {
+	return 0;
 }
 
 /*

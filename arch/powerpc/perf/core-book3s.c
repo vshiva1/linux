@@ -1002,20 +1002,20 @@ static u64 check_and_compute_delta(u64 prev, u64 val)
 	return delta;
 }
 
-static void power_pmu_read(struct perf_event *event)
+static int power_pmu_read(struct perf_event *event)
 {
 	s64 val, delta, prev;
 
 	if (event->hw.state & PERF_HES_STOPPED)
-		return;
+		return 0;
 
 	if (!event->hw.idx)
-		return;
+		return 0;
 
 	if (is_ebb_event(event)) {
 		val = read_pmc(event->hw.idx);
 		local64_set(&event->hw.prev_count, val);
-		return;
+		return 0;
 	}
 
 	/*
@@ -1029,7 +1029,7 @@ static void power_pmu_read(struct perf_event *event)
 		val = read_pmc(event->hw.idx);
 		delta = check_and_compute_delta(prev, val);
 		if (!delta)
-			return;
+			return 0;
 	} while (local64_cmpxchg(&event->hw.prev_count, prev, val) != prev);
 
 	local64_add(delta, &event->count);
@@ -1049,6 +1049,7 @@ static void power_pmu_read(struct perf_event *event)
 		if (val < 1)
 			val = 1;
 	} while (local64_cmpxchg(&event->hw.period_left, prev, val) != prev);
+	return 0;
 }
 
 /*

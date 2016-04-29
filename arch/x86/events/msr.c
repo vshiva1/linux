@@ -165,7 +165,7 @@ static inline u64 msr_read_counter(struct perf_event *event)
 
 	return now;
 }
-static void msr_event_update(struct perf_event *event)
+static int msr_event_update(struct perf_event *event)
 {
 	u64 prev, now;
 	s64 delta;
@@ -183,6 +183,7 @@ again:
 		delta = sign_extend64(delta, 31);
 
 	local64_add(delta, &event->count);
+	return 0;
 }
 
 static void msr_event_start(struct perf_event *event, int flags)

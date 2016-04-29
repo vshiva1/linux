@@ -1268,7 +1268,7 @@ static void update_event_count(struct perf_event *event, u64 now)
 	local64_add(now - prev, &event->count);
 }
 
-static void h_24x7_event_read(struct perf_event *event)
+static int h_24x7_event_read(struct perf_event *event)
 {
 	u64 now;
 	struct hv_24x7_request_buffer *request_buffer;
@@ -1289,7 +1289,7 @@ static void h_24x7_event_read(struct perf_event *event)
 		int ret;
 
 		if (__this_cpu_read(hv_24x7_txn_err))
-			return;
+			return 0;
 
 		request_buffer = (void *)get_cpu_var(hv_24x7_reqb);
 
@@ -1323,6 +1323,7 @@ static void h_24x7_event_read(struct perf_event *event)
 		now = h_24x7_get_value(event);
 		update_event_count(event, now);
 	}
+	return 0;
 }
 
 static void h_24x7_event_start(struct perf_event *event, int flags)

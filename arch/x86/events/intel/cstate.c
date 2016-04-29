@@ -322,7 +322,7 @@ static inline u64 cstate_pmu_read_counter(struct perf_event *event)
 	return val;
 }
 
-static void cstate_pmu_event_update(struct perf_event *event)
+static int cstate_pmu_event_update(struct perf_event *event)
 {
 	struct hw_perf_event *hwc = &event->hw;
 	u64 prev_raw_count, new_raw_count;
@@ -336,6 +336,7 @@ again:
 		goto again;
 
 	local64_add(new_raw_count - prev_raw_count, &event->count);
+	return 0;
 }
 
 static void cstate_pmu_event_start(struct perf_event *event, int mode)

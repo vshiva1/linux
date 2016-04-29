@@ -510,8 +510,9 @@ static int bts_event_init(struct perf_event *event)
 	return 0;
 }
 
-static void bts_event_read(struct perf_event *event)
+static int bts_event_read(struct perf_event *event)
 {
+	return 0;
 }
 
 static __init int bts_init(void)

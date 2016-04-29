@@ -361,7 +361,8 @@ void flush_ptrace_hw_breakpoint(struct task_struct *tsk)
 	t->ptrace_bps[0] = NULL;
 }
 
-void hw_breakpoint_pmu_read(struct perf_event *bp)
+int hw_breakpoint_pmu_read(struct perf_event *bp)
 {
 	/* TODO */
+	return 0;
 }
