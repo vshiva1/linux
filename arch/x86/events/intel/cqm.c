@@ -216,6 +216,9 @@ static int pkg_data_init_cpu(int cpu)
 	INIT_LIST_HEAD(&pkg_data->istate_pmonrs_lru);
 	INIT_LIST_HEAD(&pkg_data->ilstate_pmonrs_lru);
 
+	pkg_data->nr_instate_pmonrs = 0;
+	pkg_data->nr_ilstate_pmonrs = 0;
+
 	mutex_init(&pkg_data->pkg_data_mutex);
 	raw_spin_lock_init(&pkg_data->pkg_data_lock);
 
@@ -276,6 +279,10 @@ static struct pmonr *pmonr_alloc(int cpu)
 	pmonr->monr = NULL;
 	INIT_LIST_HEAD(&pmonr->rotation_entry);
 
+	pmonr->last_enter_istate = 0;
+	pmonr->last_enter_astate = 0;
+	pmonr->nr_enter_istate = 0;
+
 	pmonr->pkg_id = topology_physical_package_id(cpu);
 	summary.sched_rmid = INVALID_RMID;
 	summary.read_rmid = INVALID_RMID;
@@ -327,6 +334,8 @@ __pmonr__finish_to_astate(struct pmonr *pmonr, struct prmid *prmid)
 
 	pmonr->prmid = prmid;
 
+	pmonr->last_enter_astate = jiffies;
+
 	list_move_tail(
 		&prmid->pool_entry, &__pkg_data(pmonr, active_prmids_pool));
 	list_move_tail(
@@ -354,6 +363,8 @@ __pmonr__instate_to_astate(struct pmonr *pmonr, struct prmid *prmid)
 	 */
 	WARN_ON_ONCE(pmonr->limbo_prmid);
 
+	__pkg_data(pmonr, nr_instate_pmonrs)--;
+
 	/* Do not depend on ancestor_pmonr anymore. Make it (A)state. */
 	ancestor = pmonr->ancestor_pmonr;
 	list_del_init(&pmonr->pmonr_deps_entry);
@@ -373,6 +384,28 @@ __pmonr__instate_to_astate(struct pmonr *pmonr, struct prmid *prmid)
 		summary.read_rmid = old_summary.read_rmid;
 		atomic64_set(&pos->prmid_summary_atomic, summary.value);
 	}
+}
+
+/*
+ * Transition from (IL)state  to (A)state.
+ */
+static inline void
+__pmonr__ilstate_to_astate(struct pmonr *pmonr)
+{
+	struct prmid *prmid;
+
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+	WARN_ON_ONCE(!pmonr->limbo_prmid);
+
+	prmid = pmonr->limbo_prmid;
+	pmonr->limbo_prmid = NULL;
+	list_del_init(&pmonr->limbo_rotation_entry);
+
+	__pkg_data(pmonr, nr_ilstate_pmonrs)--;
+	__pkg_data(pmonr, nr_instate_pmonrs)++;
+	list_del_init(&prmid->pool_entry);
+
+	__pmonr__instate_to_astate(pmonr, prmid);
 }
 
 static inline void
@@ -466,7 +499,9 @@ __pmonr__to_ustate(struct pmonr *pmonr)
 
 			pmonr->limbo_prmid = NULL;
 			list_del_init(&pmonr->limbo_rotation_entry);
+			__pkg_data(pmonr, nr_ilstate_pmonrs)--;
 		} else {
+			__pkg_data(pmonr, nr_instate_pmonrs)--;
 		}
 		pmonr->ancestor_pmonr = NULL;
 	} else {
@@ -523,6 +558,9 @@ __pmonr__to_istate(struct pmonr *pmonr)
 		__pmonr__move_dependants(pmonr, ancestor);
 		list_move_tail(&pmonr->limbo_prmid->pool_entry,
 			       &__pkg_data(pmonr, pmonr_limbo_prmids_pool));
+		__pkg_data(pmonr, nr_ilstate_pmonrs)++;
+	} else {
+		__pkg_data(pmonr, nr_instate_pmonrs)++;
 	}
 
 	pmonr->ancestor_pmonr = ancestor;
@@ -535,8 +573,49 @@ __pmonr__to_istate(struct pmonr *pmonr)
 		list_move_tail(&pmonr->limbo_rotation_entry,
 			       &__pkg_data(pmonr, ilstate_pmonrs_lru));
 
+	pmonr->last_enter_istate = jiffies;
+	pmonr->nr_enter_istate++;
+
 	__pmonr__set_istate_summary(pmonr);
 
+}
+
+static inline void
+__pmonr__ilstate_to_instate(struct pmonr *pmonr)
+{
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+
+	list_move_tail(&pmonr->limbo_prmid->pool_entry,
+		       &__pkg_data(pmonr, free_prmids_pool));
+	pmonr->limbo_prmid = NULL;
+
+	__pkg_data(pmonr, nr_ilstate_pmonrs)--;
+	__pkg_data(pmonr, nr_instate_pmonrs)++;
+
+	list_del_init(&pmonr->limbo_rotation_entry);
+	__pmonr__set_istate_summary(pmonr);
+}
+
+/* Count all limbo prmids, including the ones still attached to pmonrs.
+ * Maximum number of prmids is fixed by hw and generally small.
+ */
+static int count_limbo_prmids(struct pkg_data *pkg_data)
+{
+	unsigned int c = 0;
+	struct prmid *prmid;
+
+	lockdep_assert_held(&pkg_data->pkg_data_mutex);
+
+	list_for_each_entry(
+		prmid, &pkg_data->pmonr_limbo_prmids_pool, pool_entry) {
+		c++;
+	}
+	list_for_each_entry(
+		prmid, &pkg_data->nopmonr_limbo_prmids_pool, pool_entry) {
+		c++;
+	}
+
+	return c;
 }
 
 static int intel_cqm_setup_pkg_prmid_pools(u16 pkg_id)
@@ -856,6 +935,586 @@ static bool __match_event(struct perf_event *a, struct perf_event *b)
 		return true;
 
 	return false;
+}
+
+/*
+ * Try to reuse limbo prmid's for pmonrs at the front of  ilstate_pmonrs_lru.
+ */
+static int __try_reuse_ilstate_pmonrs(struct pkg_data *pkg_data)
+{
+	int reused = 0;
+	struct pmonr *pmonr;
+
+	lockdep_assert_held(&pkg_data->pkg_data_mutex);
+	lockdep_assert_held(&pkg_data->pkg_data_lock);
+
+	while ((pmonr = list_first_entry_or_null(
+		&pkg_data->istate_pmonrs_lru, struct pmonr, rotation_entry))) {
+
+		if (__pmonr__in_instate(pmonr))
+			break;
+		__pmonr__ilstate_to_astate(pmonr);
+		reused++;
+	}
+	return reused;
+}
+
+static int try_reuse_ilstate_pmonrs(struct pkg_data *pkg_data)
+{
+	int reused;
+	unsigned long flags;
+#ifdef CONFIG_LOCKDEP
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+#endif
+
+	lockdep_assert_held(&pkg_data->pkg_data_mutex);
+
+	raw_spin_lock_irqsave_nested(&pkg_data->pkg_data_lock, flags, pkg_id);
+	reused = __try_reuse_ilstate_pmonrs(pkg_data);
+	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+	return reused;
+}
+
+
+/*
+ * A monr is only readable when all it's used pmonrs have a RMID.
+ * Therefore, the time a monr entered (A)state is the maximum of the
+ * last_enter_astate times for all (A)state pmonrs if no pmonr is in (I)state.
+ * A monr with any pmonr in (I)state has no entered (A)state.
+ * Returns monr_enter_astate time if available, otherwise min_inh_pkg is
+ * set to the smallest pkg_id where the monr's pmnor is in (I)state and
+ * the return value is undefined.
+ */
+static unsigned long
+__monr__last_enter_astate(struct monr *monr, int *min_inh_pkg)
+{
+	struct pkg_data *pkg_data;
+	u16 pkg_id;
+	unsigned long flags, astate_time = 0;
+
+	*min_inh_pkg = -1;
+	cqm_pkg_id_for_each_online(pkg_id) {
+		struct pmonr *pmonr;
+
+		if (min_inh_pkg >= 0)
+			break;
+
+		raw_spin_lock_irqsave_nested(
+				&pkg_data->pkg_data_lock, flags, pkg_id);
+
+		pmonr = monr->pmonrs[pkg_id];
+		if (__pmonr__in_istate(pmonr) && min_inh_pkg < 0)
+			*min_inh_pkg = pkg_id;
+		else if (__pmonr__in_astate(pmonr) &&
+				astate_time < pmonr->last_enter_astate)
+			astate_time = pmonr->last_enter_astate;
+
+		raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+	}
+	return astate_time;
+}
+
+/*
+ * Steal as many rmids as possible.
+ * Transition pmonrs that have stayed at least __cqm_min_mon_slice in
+ * (A)state to (I)state.
+ */
+static inline int
+__try_steal_active_pmonrs(
+	struct pkg_data *pkg_data, unsigned int max_to_steal)
+{
+	struct pmonr *pmonr, *tmp;
+	int nr_stolen = 0, min_inh_pkg;
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+	unsigned long flags, monr_astate_end_time, now = jiffies;
+	struct list_head *alist = &pkg_data->astate_pmonrs_lru;
+
+	lockdep_assert_held(&pkg_data->pkg_data_mutex);
+
+	/* pmonrs don't leave astate outside of rotation logic.
+	 * The pkg mutex protects against the pmonr leaving
+	 * astate_pmonrs_lru. The raw_spin_lock protects these list
+	 * operations from list insertions at tail coming from the
+	 * sched logic ( (U)state -> (A)state )
+	 */
+	raw_spin_lock_irqsave_nested(&pkg_data->pkg_data_lock, flags, pkg_id);
+
+	pmonr = list_first_entry(alist, struct pmonr, rotation_entry);
+	WARN_ON_ONCE(pmonr != monr_hrchy_root->pmonrs[pkg_id]);
+	WARN_ON_ONCE(pmonr->pkg_id != pkg_id);
+
+	list_for_each_entry_safe_continue(pmonr, tmp, alist, rotation_entry) {
+		bool steal_rmid = false;
+
+		WARN_ON_ONCE(!__pmonr__in_astate(pmonr));
+		WARN_ON_ONCE(pmonr->pkg_id != pkg_id);
+
+		raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+
+		monr_astate_end_time =
+			__monr__last_enter_astate(pmonr->monr, &min_inh_pkg) +
+			__cqm_min_mon_slice;
+
+		/* pmonr in this pkg is supposed to be in (A)state. */
+		WARN_ON_ONCE(min_inh_pkg == pkg_id);
+
+		/* Steal a pmonr if:
+		 *   1) Any pmonr in a pkg with pkg_id < local pkg_id is
+		 *	in (I)state.
+		 *   2) It's monr has been active for enough time.
+		 * Note that since the min_inh_pkg for a monr cannot decrease
+		 * while the monr is not active, then the monr eventually will
+		 * become active again despite the stealing of pmonrs in pkgs
+		 * with id larger than min_inh_pkg.
+		 */
+		if (min_inh_pkg >= 0 && min_inh_pkg < pkg_id)
+			steal_rmid = true;
+		if (min_inh_pkg < 0 && monr_astate_end_time <= now)
+			steal_rmid = true;
+
+		raw_spin_lock_irqsave_nested(
+			&pkg_data->pkg_data_lock, flags, pkg_id);
+		if (!steal_rmid)
+			continue;
+
+		__pmonr__to_istate(pmonr);
+		nr_stolen++;
+		if (nr_stolen == max_to_steal)
+			break;
+	}
+
+	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+
+	return nr_stolen;
+}
+
+/* It will remove the prmid from the list its attached, if used. */
+static inline int __try_use_free_prmid(struct pkg_data *pkg_data,
+				       struct prmid *prmid, bool *succeed)
+{
+	struct pmonr *pmonr;
+	int nr_activated = 0;
+
+	lockdep_assert_held(&pkg_data->pkg_data_mutex);
+	lockdep_assert_held(&pkg_data->pkg_data_lock);
+
+	*succeed = false;
+	nr_activated += __try_reuse_ilstate_pmonrs(pkg_data);
+	pmonr = list_first_entry_or_null(&pkg_data->istate_pmonrs_lru,
+					 struct pmonr, rotation_entry);
+	if (!pmonr)
+		return nr_activated;
+	WARN_ON_ONCE(__pmonr__in_ilstate(pmonr));
+	WARN_ON_ONCE(!__pmonr__in_instate(pmonr));
+
+	/* the state transition function will move the prmid to
+	 * the active lru list.
+	 */
+	__pmonr__instate_to_astate(pmonr, prmid);
+	nr_activated++;
+	*succeed = true;
+	return nr_activated;
+}
+
+static inline int __try_use_free_prmids(struct pkg_data *pkg_data)
+{
+	struct prmid *prmid, *tmp_prmid;
+	unsigned long flags;
+	int nr_activated = 0;
+	bool succeed;
+#ifdef CONFIG_DEBUG_SPINLOCK
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+#endif
+
+	lockdep_assert_held(&pkg_data->pkg_data_mutex);
+	/* Lock protects free_prmids_pool, istate_pmonrs_lru and
+	 * the monr hrchy.
+	 */
+	raw_spin_lock_irqsave_nested(&pkg_data->pkg_data_lock, flags, pkg_id);
+
+	list_for_each_entry_safe(prmid, tmp_prmid,
+				 &pkg_data->free_prmids_pool, pool_entry) {
+
+		/* Removes the free prmid if used. */
+		nr_activated += __try_use_free_prmid(pkg_data,
+						     prmid, &succeed);
+	}
+
+	nr_activated += __try_reuse_ilstate_pmonrs(pkg_data);
+	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+
+	return nr_activated;
+}
+
+/* Update prmid's of pmonrs in ilstate. To mantain fairness of rotation
+ * logic, Try to activate (IN)state pmonrs with recovered prmids when
+ * possible rather than simply adding them to free rmids list. This prevents,
+ * ustate pmonrs (pmonrs that haven't wait in istate_pmonrs_lru) to obtain
+ * the newly available RMIDs before those waiting in queue.
+ */
+static inline int
+__try_free_ilstate_prmids(struct pkg_data *pkg_data,
+			  unsigned int cqm_threshold,
+			  unsigned int *min_occupancy_dirty)
+{
+	struct pmonr *pmonr, *tmp_pmonr, *istate_pmonr;
+	struct prmid *prmid;
+	unsigned long flags;
+	u64 val;
+	bool succeed;
+	int ret, nr_activated = 0;
+#ifdef CONFIG_LOCKDEP
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+#endif
+
+	lockdep_assert_held(&pkg_data->pkg_data_mutex);
+
+	WARN_ON_ONCE(try_reuse_ilstate_pmonrs(pkg_data));
+
+	/* No need to acquire pkg lock to iterate over ilstate_pmonrs_lru
+	 * since only rotation logic modifies it.
+	 */
+	list_for_each_entry_safe(
+		pmonr, tmp_pmonr,
+		&pkg_data->ilstate_pmonrs_lru, limbo_rotation_entry) {
+
+		if (WARN_ON_ONCE(list_empty(&pkg_data->istate_pmonrs_lru)))
+			return nr_activated;
+
+		istate_pmonr = list_first_entry(&pkg_data->istate_pmonrs_lru,
+						struct pmonr, rotation_entry);
+
+		if (pmonr == istate_pmonr) {
+			raw_spin_lock_irqsave_nested(
+				&pkg_data->pkg_data_lock, flags, pkg_id);
+
+			nr_activated++;
+			__pmonr__ilstate_to_astate(pmonr);
+
+			raw_spin_unlock_irqrestore(
+				&pkg_data->pkg_data_lock, flags);
+			continue;
+		}
+
+		ret = __cqm_prmid_update(pmonr->limbo_prmid,
+					  __rmid_min_update_time);
+		if (WARN_ON_ONCE(ret < 0))
+			continue;
+
+		val = atomic64_read(&pmonr->limbo_prmid->last_read_value);
+		if (val > cqm_threshold) {
+			if (val < *min_occupancy_dirty)
+				*min_occupancy_dirty = val;
+			continue;
+		}
+
+		raw_spin_lock_irqsave_nested(
+			&pkg_data->pkg_data_lock, flags, pkg_id);
+
+		prmid = pmonr->limbo_prmid;
+
+		/* moves the prmid to free_prmids_pool. */
+		__pmonr__ilstate_to_instate(pmonr);
+
+		/* Do not affect ilstate_pmonrs_lru.
+		 * If succeeds, prmid will end in active_prmids_pool,
+		 * otherwise, stays in free_prmids_pool where the
+		 * ilstate_to_instate transition left it.
+		 */
+		nr_activated += __try_use_free_prmid(pkg_data,
+						     prmid, &succeed);
+
+		raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+	}
+	return nr_activated;
+}
+
+/* Update limbo prmid's no associated to a pmonr. To mantain fairness of
+ * rotation logic, Try to activate (IN)state pmonrs with recovered prmids when
+ * possible rather than simply adding them to free rmids list. This prevents,
+ * ustate pmonrs (pmonrs that haven't wait in istate_pmonrs_lru) to obtain
+ * the newly available RMIDs before those waiting in queue.
+ */
+static inline int
+__try_free_limbo_prmids(struct pkg_data *pkg_data,
+			unsigned int cqm_threshold,
+			unsigned int *min_occupancy_dirty)
+{
+	struct prmid *prmid, *tmp_prmid;
+	unsigned long flags;
+	bool succeed;
+	int ret, nr_activated = 0;
+
+#ifdef CONFIG_LOCKDEP
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+#endif
+	u64 val;
+
+	lockdep_assert_held(&pkg_data->pkg_data_mutex);
+
+	list_for_each_entry_safe(
+		prmid, tmp_prmid,
+		&pkg_data->nopmonr_limbo_prmids_pool, pool_entry) {
+
+		/* If min update time is good enough for user, it is good
+		 * enough for rotation.
+		 */
+		ret = __cqm_prmid_update(prmid, __rmid_min_update_time);
+		if (WARN_ON_ONCE(ret < 0))
+			continue;
+
+		val = atomic64_read(&prmid->last_read_value);
+		if (val > cqm_threshold) {
+			if (val < *min_occupancy_dirty)
+				*min_occupancy_dirty = val;
+			continue;
+		}
+		raw_spin_lock_irqsave_nested(
+			&pkg_data->pkg_data_lock, flags, pkg_id);
+
+		nr_activated = __try_use_free_prmid(pkg_data, prmid, &succeed);
+		if (!succeed)
+			list_move_tail(&prmid->pool_entry,
+				       &pkg_data->free_prmids_pool);
+
+		raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+	}
+	return nr_activated;
+}
+
+/*
+ * Activate (I)state pmonrs.
+ *
+ * @min_occupancy_dirty: pointer to store the minimum occupancy of any
+ *   dirty prmid.
+ *
+ * Try to activate as many pmonrs as possible before utilizing limbo prmids
+ * pointed by ilstate pmonrs in order to minimize the number of dirty rmids
+ * that move to other pmonr when cqm_threshold > 0.
+ */
+static int __try_activate_istate_pmonrs(
+	struct pkg_data *pkg_data, unsigned int cqm_threshold,
+	unsigned int *min_occupancy_dirty)
+{
+	int nr_activated = 0;
+
+	lockdep_assert_held(&pkg_data->pkg_data_mutex);
+
+	/* Start reusing limbo prmids no pointed by any ilstate pmonr. */
+	nr_activated += __try_free_limbo_prmids(pkg_data, cqm_threshold,
+						min_occupancy_dirty);
+
+	/* Try to use newly available free prmids */
+	nr_activated += __try_use_free_prmids(pkg_data);
+
+	/* Continue reusing limbo prmids pointed by a ilstate pmonr. */
+	nr_activated += __try_free_ilstate_prmids(pkg_data, cqm_threshold,
+						  min_occupancy_dirty);
+	/* Try to use newly available free prmids */
+	nr_activated += __try_use_free_prmids(pkg_data);
+
+	WARN_ON_ONCE(try_reuse_ilstate_pmonrs(pkg_data));
+	return nr_activated;
+}
+
+/* Number of pmonrs that have been in (I)state for at least min_wait_jiffies.
+ * XXX: Use rcu to access to istate_pmonrs_lru.
+ */
+static int
+count_istate_pmonrs(struct pkg_data *pkg_data,
+		    unsigned int min_wait_jiffies, bool exclude_limbo)
+{
+	unsigned long flags;
+	unsigned int c = 0;
+	struct pmonr *pmonr;
+#ifdef CONFIG_DEBUG_SPINLOCK
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+#endif
+
+	lockdep_assert_held(&pkg_data->pkg_data_mutex);
+
+	raw_spin_lock_irqsave_nested(&pkg_data->pkg_data_lock, flags, pkg_id);
+	list_for_each_entry(
+		pmonr, &pkg_data->istate_pmonrs_lru, rotation_entry) {
+
+		if (jiffies - pmonr->last_enter_istate < min_wait_jiffies)
+			break;
+
+		WARN_ON_ONCE(!__pmonr__in_istate(pmonr));
+		if (exclude_limbo && __pmonr__in_ilstate(pmonr))
+			continue;
+		c++;
+	}
+	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+
+	return c;
+}
+
+static inline int
+read_nr_instate_pmonrs(struct pkg_data *pkg_data, u16 pkg_id) {
+	unsigned long flags;
+	int n;
+
+	raw_spin_lock_irqsave_nested(&pkg_data->pkg_data_lock, flags, pkg_id);
+	n = READ_ONCE(cqm_pkgs_data[pkg_id]->nr_instate_pmonrs);
+	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+	WARN_ON_ONCE(n < 0);
+	return n;
+}
+
+/*
+ * Rotate RMIDs among rpgks.
+ *
+ * For reads to be meaningful valid rmids had to be programmed for
+ * enough time to capture enough instances of cache allocation/retirement
+ * to yield useful occupancy values. The approach to handle that problem
+ * is to guarantee that every pmonr will spend at least T time in (A)state
+ * when such transition has occurred and hope that T is long enough.
+ *
+ * The hardware retains occupancy for 'old' tags, even after changing rmid
+ * for a task/cgroup. To workaround this problem, we keep retired rmids
+ * as limbo in each pmonr and use their occupancy. Also we prefer reusing
+ * such limbo rmids rather than free ones since their residual occupancy
+ * is valid occupancy for the task/cgroup.
+ *
+ * Rotation works by taking away an RMID from a group (the old RMID),
+ * and assigning the free RMID to another group (the new RMID). We must
+ * then wait for the old RMID to not be used (no cachelines tagged).
+ * This ensure that all cachelines are tagged with 'active' RMIDs. At
+ * this point we can start reading values for the new RMID and treat the
+ * old RMID as the free RMID for the next rotation.
+ */
+void
+__intel_cqm_rmid_rotate(struct pkg_data *pkg_data,
+			unsigned int nr_max_limbo,
+			unsigned int nr_min_activated)
+{
+	int nr_instate, nr_to_steal, nr_stolen, nr_slo_violated;
+	int limbo_cushion = 0;
+	unsigned int cqm_threshold = 0, min_occupancy_dirty;
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+
+	/*
+	 * To avoid locking the process, keep track of pmonrs that
+	 * are activated during this execution of rotaton logic, so
+	 * we don't have to rely on the state of the pmonrs lists
+	 * to estimate progress, that can be modified during
+	 * creation and destruction of events and cgroups.
+	 */
+	int nr_activated = 0;
+
+	mutex_lock_nested(&pkg_data->pkg_data_mutex, pkg_id);
+
+	/*
+	 * Since ilstates are created only during stealing or destroying pmonrs,
+	 * but destroy requires pkg_data_mutex, then it is only necessary to
+	 * try to reuse ilstate once per call. Furthermore, new ilstates during
+	 * iteration in rotation logic is an error.
+	*/
+	nr_activated += try_reuse_ilstate_pmonrs(pkg_data);
+
+again:
+	nr_stolen = 0;
+	min_occupancy_dirty = UINT_MAX;
+	/*
+	 * Three types of actions are taken in rotation logic:
+	 *   1) Try to activate pmonrs using limbo RMIDs.
+	 *   2) Steal more RMIDs. Ideally the number of RMIDs in limbo equals
+	 *   the number of pmonrs in (I)state plus the limbo_cushion aimed to
+	 *   compensate for limbo RMIDs that do no drop occupancy fast enough.
+	 *   The actual number stolen is constrained
+	 *   prevent having more than nr_max_limbo RMIDs in limbo.
+	 *   3) Increase cqm_threshold so even RMIDs with residual occupancy
+	 *   are utilized to activate (I)state primds. Doing so increases the
+	 *   error in the reported value in a way undetectable to the user, so
+	 *   it is left as a last resource.
+	 */
+
+	/* Verify all available ilimbo where activated where they
+	 * were supposed to.
+	 */
+	WARN_ON_ONCE(try_reuse_ilstate_pmonrs(pkg_data) > 0);
+
+	/* Activate all pmonrs that we can by recycling rmids in limbo */
+	nr_activated += __try_activate_istate_pmonrs(
+		pkg_data, cqm_threshold, &min_occupancy_dirty);
+
+	/* Count nr of pmonrs that are inherited and do not have limbo_prmid */
+	nr_instate = read_nr_instate_pmonrs(pkg_data, pkg_id);
+	WARN_ON_ONCE(nr_instate < 0);
+	/*
+	 * If no pmonr needs rmid, then it's time to let go. pmonrs in ilimbo
+	 * are not counted since the limbo_prmid can be reused, once its time
+	 * to activate them.
+	 */
+	if (nr_instate == 0)
+		goto exit;
+
+	WARN_ON_ONCE(!list_empty(&pkg_data->free_prmids_pool));
+	WARN_ON_ONCE(try_reuse_ilstate_pmonrs(pkg_data) > 0);
+
+	/* There are still pmonrs waiting for RMID, check if the SLO about
+	 * _cqm_max_wait_mon has been violated. If so, use a more
+	 * aggresive version of RMID stealing and reutilization.
+	 */
+	nr_slo_violated = count_istate_pmonrs(
+		pkg_data, msecs_to_jiffies(__cqm_max_wait_mon), false);
+
+	/* First measure against SLO violation is to increase number of stolen
+	 * RMIDs beyond the number of pmonrs waiting for RMID. The magnitud of
+	 * the limbo_cushion is proportional to nr_slo_violated (but
+	 * arbitarily weighthed).
+	 */
+	if (nr_slo_violated)
+		limbo_cushion = (nr_slo_violated + 1) / 2;
+
+	/*
+	 * Need more free rmids. Steal RMIDs from active pmonrs and place them
+	 * into limbo lru. Steal enough to have high chances that eventually
+	 * occupancy of enough RMIDs in limbo will drop enough to be reused
+	 * (the limbo_cushion).
+	 */
+	nr_to_steal = min(nr_instate + limbo_cushion,
+			  max(0, (int)nr_max_limbo -
+				 count_limbo_prmids(pkg_data)));
+
+	if (nr_to_steal)
+		nr_stolen = __try_steal_active_pmonrs(pkg_data, nr_to_steal);
+
+	/* Already stole as many as possible, finish if no SLO violations. */
+	if (!nr_slo_violated)
+		goto exit;
+
+	/*
+	 * There are SLO violations due to recycling RMIDs not progressing
+	 * fast enough. Possible (non-exclusive) causal factors are:
+	 *   1) Too many RMIDs in limbo do not drop occupancy despite having
+	 *      spent a "reasonable" time in limbo lru.
+	 *   2) RMIDs in limbo have not been for long enough to have drop
+	 *	occupancy, but they will within "reasonable" time.
+	 *
+	 * If (2) only, it is ok to wait, since eventually the rmids
+	 * will rotate. If (1), there is a danger of being stuck, in that case
+	 * the dirty threshold, cqm_threshold, must be increased.
+	 * The notion of "reasonable" time is ambiguous since the more SLOs
+	 * violations, the more urgent it is to rotate. For now just try
+	 * to guarantee any progress is made (activate at least one prmid
+	 * with SLO violated).
+	 */
+
+	/* Using the minimum observed occupancy in dirty rmids guarantees to
+	 * to recover at least one rmid per iteration. Check if constrainst
+	 * would allow to use such threshold, otherwise makes no sense to
+	 * retry.
+	 */
+	if (nr_activated < nr_min_activated && min_occupancy_dirty <=
+		READ_ONCE(__intel_cqm_max_threshold) / cqm_l3_scale) {
+
+		cqm_threshold = min_occupancy_dirty;
+		goto again;
+	}
+exit:
+	mutex_unlock(&pkg_data->pkg_data_mutex);
 }
 
 static struct pmu intel_cqm_pmu;

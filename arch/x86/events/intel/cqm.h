@@ -125,9 +125,16 @@ struct monr;
  *				prmids.
  * @limbo_rotation_entry:	List entry to attach to ilstate_pmonrs_lru when
  *				this pmonr is in (IL)state.
+ * @last_enter_istate:		Time last enter (I)state.
+ * @last_enter_astate:		Time last enter (A)state. Used in rotation logic
+ *				to guarantee that each pmonr gets a minimum
+ *				time in	(A)state.
  * @rotation_entry:		List entry to attach to pmonr rotation lists in
  *				pkg_data.
  * @monr:			The monr that contains this pmonr.
+ * @nr_enter_istate:		Track number of times entered (I)state. Useful
+ *				signal to diagnose excessive contention for
+ *				rmids in this package.
  * @pkg_id:			Auxiliar variable with pkg id for this pmonr.
  * @prmid_summary_atomic:	Atomic accesor to store a union prmid_summary
  *				that represent the state of this pmonr.
@@ -196,6 +203,10 @@ struct pmonr {
 	struct monr				*monr;
 	struct list_head			rotation_entry;
 
+	unsigned long				last_enter_istate;
+	unsigned long				last_enter_astate;
+	unsigned int				nr_enter_istate;
+
 	u16					pkg_id;
 
 	/* all writers are sync'ed by package's lock. */
@@ -220,6 +231,8 @@ struct pmonr {
  * @ilsate_pmonrs_lru:		pmonrs in (IL)state, these pmonrs have a valid
  *				limbo_prmid. It's a subset of istate_pmonrs_lru.
  *				Sorted increasingly by pmonr.last_enter_istate.
+ * @nr_instate_pmonrs		nr of pmonrs in (IN)state.
+ * @nr_ilstate_pmonrs		nr of pmonrs in (IL)state.
  * @pkg_data_mutex:		Hold for stability when modifying pmonrs
  *				hierarchy.
  * @pkg_data_lock:		Hold to protect variables that may be accessed
@@ -248,6 +261,9 @@ struct pkg_data {
 	/* Superset of ilstate_pmonrs_lru. */
 	struct list_head	istate_pmonrs_lru;
 	struct list_head	ilstate_pmonrs_lru;
+
+	int			nr_instate_pmonrs;
+	int			nr_ilstate_pmonrs;
 
 	struct mutex		pkg_data_mutex;
 	raw_spinlock_t		pkg_data_lock;
@@ -412,6 +428,30 @@ static inline int monr_hrchy_count_held_raw_spin_locks(void)
 #define CQM_DEFAULT_ROTATION_PERIOD 1200	/* ms */
 
 /*
+ * Service Level Objectives (SLO) for the rotation logic.
+ *
+ * @__cqm_min_duration_mon_slice: Minimum duration of a monitored slice.
+ * @__cqm_max_wait_monitor: Maximum time that a pmonr can pass waiting for an
+ *   RMID without rotation logic making any progress. Once elapsed for any
+ *  prmid, the reusing threshold (__intel_cqm_max_threshold) can be increased,
+ *  potentially increasing the speed at which RMIDs are reused, but potentially
+ *  introducing measurement error.
+ */
+#define CQM_DEFAULT_MIN_MON_SLICE 2000	/* ms */
+static unsigned int __cqm_min_mon_slice = CQM_DEFAULT_MIN_MON_SLICE;
+
+#define CQM_DEFAULT_MAX_WAIT_MON 20000 /* ms */
+static unsigned int __cqm_max_wait_mon = CQM_DEFAULT_MAX_WAIT_MON;
+
+/*
+ * If we fail to assign any RMID for intel_cqm_rotation because cachelines are
+ * still tagged with RMIDs in limbo even after having stolen enough rmids (a
+ * maximum number of rmids in limbo at any time), then we increment the dirty
+ * threshold to allow at least one RMID to be recycled. This mitigates the
+ * problem caused when cachelines tagged with a RMID are not evicted but
+ * it introduces error in the occupancy reads but allows the rotation of rmids
+ * to proceed.
+ *
  * __intel_cqm_max_threshold provides an upper bound on the threshold,
  * and is measured in bytes because it's exposed to userland.
  * It's units are bytes must be scaled by cqm_l3_scale to obtain cache lines.
