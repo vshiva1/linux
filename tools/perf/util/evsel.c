@@ -1191,6 +1191,9 @@ void perf_evsel__compute_deltas(struct perf_evsel *evsel, int cpu, int thread,
 	if (!evsel->prev_raw_counts)
 		return;
 
+	if (perf_counts_values__is_na(count))
+		return;
+
 	if (cpu == -1) {
 		tmp = evsel->prev_raw_counts->aggr;
 		evsel->prev_raw_counts->aggr = *count;
@@ -1199,26 +1202,43 @@ void perf_evsel__compute_deltas(struct perf_evsel *evsel, int cpu, int thread,
 		*perf_counts(evsel->prev_raw_counts, cpu, thread) = *count;
 	}
 
-	count->val = count->val - tmp.val;
+	/* Snapshot events do not calculate deltas for count values. */
+	if (!evsel->snapshot)
+		count->val = count->val - tmp.val;
 	count->ena = count->ena - tmp.ena;
 	count->run = count->run - tmp.run;
 }
 
 void perf_counts_values__scale(struct perf_counts_values *count,
-			       bool scale, s8 *pscaled)
+			       bool scale, bool per_pkg, bool snapshot, s8 *pscaled)
 {
 	s8 scaled = 0;
 
+	if (perf_counts_values__is_na(count)) {
+		if (pscaled)
+			*pscaled = -1;
+		return;
+	}
+
 	if (scale) {
-		if (count->run == 0) {
+		/*
+		 * per-pkg events can have run == 0 in a CPU and still be
+		 * valid.
+		 */
+		if (count->run == 0 && !per_pkg) {
 			scaled = -1;
 			count->val = 0;
 		} else if (count->run < count->ena) {
 			scaled = 1;
-			count->val = (u64)((double) count->val * count->ena / count->run + 0.5);
+			/* Snapshot events do not scale counts values. */
+			if (!snapshot && count->run)
+				count->val = (u64)((double) count->val * count->ena /
+					     count->run + 0.5);
 		}
-	} else
-		count->ena = count->run = 0;
+
+	} else {
+		count->run = count->ena;
+	}
 
 	if (pscaled)
 		*pscaled = scaled;
@@ -1232,8 +1252,10 @@ int perf_evsel__read(struct perf_evsel *evsel, int cpu, int thread,
 	if (FD(evsel, cpu, thread) < 0)
 		return -EINVAL;
 
-	if (readn(FD(evsel, cpu, thread), count, sizeof(*count)) <= 0)
+	if (readn(FD(evsel, cpu, thread), count, sizeof(*count)) <= 0) {
+		perf_counts_values__make_na(count);
 		return -errno;
+	}
 
 	return 0;
 }
@@ -1241,6 +1263,7 @@ int perf_evsel__read(struct perf_evsel *evsel, int cpu, int thread,
 int __perf_evsel__read_on_cpu(struct perf_evsel *evsel,
 			      int cpu, int thread, bool scale)
 {
+	int ret = 0;
 	struct perf_counts_values count;
 	size_t nv = scale ? 3 : 1;
 
@@ -1250,13 +1273,17 @@ int __perf_evsel__read_on_cpu(struct perf_evsel *evsel,
 	if (evsel->counts == NULL && perf_evsel__alloc_counts(evsel, cpu + 1, thread + 1) < 0)
 		return -ENOMEM;
 
-	if (readn(FD(evsel, cpu, thread), &count, nv * sizeof(u64)) <= 0)
-		return -errno;
+	if (readn(FD(evsel, cpu, thread), &count, nv * sizeof(u64)) <= 0) {
+		perf_counts_values__make_na(&count);
+		ret = -errno;
+		goto exit;
+	}
 
 	perf_evsel__compute_deltas(evsel, cpu, thread, &count);
-	perf_counts_values__scale(&count, scale, NULL);
+	perf_counts_values__scale(&count, scale, evsel->per_pkg, evsel->snapshot, NULL);
+exit:
 	*perf_counts(evsel->counts, cpu, thread) = count;
-	return 0;
+	return ret;
 }
 
 static int get_group_fd(struct perf_evsel *evsel, int cpu, int thread)

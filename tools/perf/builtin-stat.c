@@ -311,10 +311,8 @@ static int read_counter(struct perf_evsel *counter)
 
 			count = perf_counts(counter->counts, cpu, thread);
 			if (perf_evsel__read(counter, cpu, thread, count)) {
-				counter->counts->scaled = -1;
-				perf_counts(counter->counts, cpu, thread)->ena = 0;
-				perf_counts(counter->counts, cpu, thread)->run = 0;
-				return -1;
+				/* do not write stat for failed reads. */
+				continue;
 			}
 
 			if (STAT_RECORD) {
@@ -725,12 +723,16 @@ static int run_perf_stat(int argc, const char **argv)
 
 static void print_running(u64 run, u64 ena)
 {
+	bool is_na = run == PERF_COUNTS_NA || ena == PERF_COUNTS_NA || !ena;
+
 	if (csv_output) {
-		fprintf(stat_config.output, "%s%" PRIu64 "%s%.2f",
-					csv_sep,
-					run,
-					csv_sep,
-					ena ? 100.0 * run / ena : 100.0);
+		if (is_na)
+			fprintf(stat_config.output, "%sNA%sNA", csv_sep, csv_sep);
+		else
+			fprintf(stat_config.output, "%s%" PRIu64 "%s%.2f",
+				csv_sep, run, csv_sep, 100.0 * run / ena);
+	} else if (is_na) {
+		fprintf(stat_config.output, "  (NA)");
 	} else if (run != ena) {
 		fprintf(stat_config.output, "  (%.2f%%)", 100.0 * run / ena);
 	}
@@ -1103,7 +1105,7 @@ static void printout(int id, int nr, struct perf_evsel *counter, double uval,
 		if (counter->cgrp)
 			os.nfields++;
 	}
-	if (run == 0 || ena == 0 || counter->counts->scaled == -1) {
+	if (run == PERF_COUNTS_NA || ena == PERF_COUNTS_NA || counter->counts->scaled == -1) {
 		if (metric_only) {
 			pm(&os, NULL, "", "", 0);
 			return;
@@ -1209,12 +1211,17 @@ static void print_aggr(char *prefix)
 		id = aggr_map->map[s];
 		first = true;
 		evlist__for_each_entry(evsel_list, counter) {
+			bool all_nan = true;
 			val = ena = run = 0;
 			nr = 0;
 			for (cpu = 0; cpu < perf_evsel__nr_cpus(counter); cpu++) {
 				s2 = aggr_get_id(perf_evsel__cpus(counter), cpu);
 				if (s2 != id)
 					continue;
+				/* skip NA reads. */
+				if (perf_counts_values__is_na(perf_counts(counter->counts, cpu, 0)))
+					continue;
+				all_nan = false;
 				val += perf_counts(counter->counts, cpu, 0)->val;
 				ena += perf_counts(counter->counts, cpu, 0)->ena;
 				run += perf_counts(counter->counts, cpu, 0)->run;
@@ -1228,6 +1235,10 @@ static void print_aggr(char *prefix)
 				fprintf(output, "%s", prefix);
 
 			uval = val * counter->scale;
+			if (all_nan) {
+				run = PERF_COUNTS_NA;
+				ena = PERF_COUNTS_NA;
+			}
 			printout(id, nr, counter, uval, prefix, run, ena, 1.0);
 			if (!metric_only)
 				fputc('\n', output);
@@ -1306,7 +1317,10 @@ static void print_counter(struct perf_evsel *counter, char *prefix)
 		if (prefix)
 			fprintf(output, "%s", prefix);
 
-		uval = val * counter->scale;
+		if (val != PERF_COUNTS_NA)
+			uval = val * counter->scale;
+		else
+			uval = NAN;
 		printout(cpu, 0, counter, uval, prefix, run, ena, 1.0);
 
 		fputc('\n', output);

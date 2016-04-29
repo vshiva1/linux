@@ -82,6 +82,10 @@ struct perf_evsel_config_term {
  * @is_pos: the position (counting backwards) of the event id (PERF_SAMPLE_ID or
  *          PERF_SAMPLE_IDENTIFIER) in a non-sample event i.e. if sample_id_all
  *          is used there is an id sample appended to non-sample events
+ * @snapshot: an event that whose raw value cannot be extrapolated based on
+ *	    the ratio of running/enabled time.
+ * @per_pkg: an event that runs package wide. All cores in same package will
+ *	    read the same value, even if running time == 0.
  * @priv:   And what is in its containing unnamed union are tool specific
  */
 struct perf_evsel {
@@ -153,8 +157,8 @@ static inline int perf_evsel__nr_cpus(struct perf_evsel *evsel)
 	return perf_evsel__cpus(evsel)->nr;
 }
 
-void perf_counts_values__scale(struct perf_counts_values *count,
-			       bool scale, s8 *pscaled);
+void perf_counts_values__scale(struct perf_counts_values *count, bool scale,
+			       bool per_pkg, bool snapshot, s8 *pscaled);
 
 void perf_evsel__compute_deltas(struct perf_evsel *evsel, int cpu, int thread,
 				struct perf_counts_values *count);
