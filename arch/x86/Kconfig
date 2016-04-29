@@ -160,6 +160,13 @@ config X86
 	select ARCH_USES_HIGH_VMA_FLAGS		if X86_INTEL_MEMORY_PROTECTION_KEYS
 	select ARCH_HAS_PKEYS			if X86_INTEL_MEMORY_PROTECTION_KEYS
 
+config INTEL_RDT
+	def_bool y
+	depends on PERF_EVENTS && CPU_SUP_INTEL
+	---help---
+	Enable Resource Director Technology (RDT) for Intel Xeon Microprocessors.
+	RDT includes Cache Monitoring Technology (CMT aka CQM).
+
 config INSTRUCTION_DECODER
 	def_bool y
 	depends on KPROBES || PERF_EVENTS || UPROBES
