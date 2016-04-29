@@ -2291,18 +2291,222 @@ intel_cqm_setup_event(struct perf_event *event, struct perf_event **group)
 	return monr_hrchy_attach_event(event);
 }
 
+static struct monr *
+monr_next_child(struct monr *pos, struct monr *parent)
+{
+#ifdef CONFIG_LOCKDEP
+	WARN_ON(!monr_hrchy_count_held_raw_spin_locks());
+#endif
+	if (!pos)
+		return list_first_entry_or_null(
+			&parent->children, struct monr, parent_entry);
+	if (list_is_last(&pos->parent_entry, &parent->children))
+		return NULL;
+	return list_next_entry(pos, parent_entry);
+}
+
+static struct monr *
+monr_next_descendant_pre(struct monr *pos, struct monr *root)
+{
+	struct monr *next;
+
+#ifdef CONFIG_LOCKDEP
+	WARN_ON(!monr_hrchy_count_held_raw_spin_locks());
+#endif
+	if (!pos)
+		return root;
+	next = monr_next_child(NULL, pos);
+	if (next)
+		return next;
+	while (pos != root) {
+		next = monr_next_child(pos, pos->parent);
+		if (next)
+			return next;
+		pos = pos->parent;
+	}
+	return NULL;
+}
+
+/* Read pmonr's summary, safe to call without pkg's prmids lock.
+ * The possible scenarios are:
+ *  - summary's occupancy cannot be read, return -1.
+ *  - summary has no RMID but could be read as zero occupancy, return 0 and set
+ *    rmid = INVALID_RMID.
+ *  - summary has valid read RMID, set rmid to it.
+ */
+static inline int
+pmonr__get_read_rmid(struct pmonr *pmonr, u32 *rmid, bool fail_on_inherited)
+{
+	union prmid_summary summary;
+
+	*rmid = INVALID_RMID;
+
+	summary.value = atomic64_read(&pmonr->prmid_summary_atomic);
+	/* A pmonr in (I)state that doesn't fail can report it's limbo_prmid
+	 * or NULL.
+	 */
+	if (prmid_summary__is_istate(summary) && fail_on_inherited)
+		return -1;
+	/* A pmonr with inactive monitoring can be safely ignored. */
+	if (!prmid_summary__is_mon_active(summary))
+		return 0;
+
+	/* A pmonr that hasnt run in a pkg is safe to ignore since it
+	 * cannot have occupancy there.
+	 */
+	if (prmid_summary__is_ustate(summary))
+		return 0;
+	/* At this point the pmonr is either in (A)state or (I)state
+	 * with fail_on_inherited=false . In the latter case,
+	 * read_rmid is INVALID_RMID and is a successful read_rmid.
+	 */
+	*rmid = summary.read_rmid;
+	return 0;
+}
+
+/* Read occupancy for all pmonrs in the subtree rooted at monr
+ * for the current package.
+ * Best effort two-stages read. First, obtain all RMIDs in subtree
+ * with locks held. The rmids are added to stack. If stack is full
+ * proceed to update and read in place. After finish storing the RMIDs,
+ * update and read occupancy for rmids in stack.
+ */
+static int pmonr__read_subtree(struct monr *monr, u16 pkg_id,
+			       u64 *total, bool fail_on_inh_descendant)
+{
+	struct monr *pos = NULL;
+	struct astack astack;
+	int ret;
+	unsigned long flags;
+	u64 count;
+	struct pkg_data *pkg_data = cqm_pkgs_data[pkg_id];
+
+	*total = 0;
+	/* Must run in a CPU in the package to read. */
+	if (WARN_ON_ONCE(pkg_id !=
+			 topology_physical_package_id(smp_processor_id())))
+		return -1;
+
+	astack__init(&astack, NR_RMIDS_PER_NODE - 1, pkg_id);
+
+	/* Lock to protect againsts changes in pmonr hierarchy. */
+	raw_spin_lock_irqsave_nested(&pkg_data->pkg_data_lock, flags, pkg_id);
+
+	while ((pos = monr_next_descendant_pre(pos, monr))) {
+		struct prmid *prmid;
+		u32 rmid;
+		/* the pmonr of the monr to read cannot be inherited,
+		 * descendants may, depending on flag.
+		 */
+		bool fail_on_inh = pos == monr || fail_on_inh_descendant;
+
+		ret = pmonr__get_read_rmid(pos->pmonrs[pkg_id],
+					   &rmid, fail_on_inh);
+		if (ret)
+			goto exit_error;
+
+		if (rmid == INVALID_RMID)
+			continue;
+
+		ret = astack__push(&astack);
+		if (!ret) {
+			__astack__top(&astack, rmids) = rmid;
+			continue;
+		}
+		/* If no space in stack, update and read here (slower). */
+		prmid = __prmid_from_rmid(pkg_id, rmid);
+		if (WARN_ON_ONCE(!prmid))
+			goto exit_error;
+
+		ret = cqm_prmid_update(prmid);
+		if (ret < 0)
+			goto exit_error;
+
+		*total += atomic64_read(&prmid->last_read_value);
+	}
+	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+
+	ret = astack__rmids_sum_apply(&astack, pkg_id,
+				      &__rmid_fn__cqm_prmid_update, &count);
+	if (ret < 0)
+		return ret;
+
+	*total += count;
+	astack__release(&astack);
+
+	return 0;
+
+exit_error:
+	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+	astack__release(&astack);
+	return ret;
+}
+
+/* Read current package immediately and remote pkg (if any) from cache. */
+static void __read_task_event(struct perf_event *event)
+{
+	int i, ret;
+	u64 count = 0;
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+	struct monr *monr = monr_from_event(event);
+
+	/* Read either local or polled occupancy from all packages. */
+	cqm_pkg_id_for_each_online(i) {
+		struct prmid *prmid;
+		u32 rmid;
+		struct pmonr *pmonr = monr->pmonrs[i];
+
+		ret = pmonr__get_read_rmid(pmonr, &rmid, true);
+		if (ret)
+			return;
+		if (rmid == INVALID_RMID)
+			continue;
+		prmid = __prmid_from_rmid(i, rmid);
+		if (WARN_ON_ONCE(!prmid))
+			return;
+
+		/* update and read local for this cpu's package. */
+		if (i == pkg_id)
+			cqm_prmid_update(prmid);
+		count += atomic64_read(&prmid->last_read_value);
+	}
+	local64_set(&event->count, count);
+}
+
 /* Read current package immediately and remote pkg (if any) from cache. */
 static void intel_cqm_event_read(struct perf_event *event)
 {
-	union prmid_summary summary;
-	struct prmid *prmid;
+	struct monr *monr;
+	u64 count;
 	u16 pkg_id = topology_physical_package_id(smp_processor_id());
-	struct pmonr *pmonr = monr_from_event(event)->pmonrs[pkg_id];
 
-	summary.value = atomic64_read(&pmonr->prmid_summary_atomic);
-	prmid = __prmid_from_rmid(pkg_id, summary.read_rmid);
-	cqm_prmid_update(prmid);
-	local64_set(&event->count, atomic64_read(&prmid->last_read_value));
+	monr = monr_from_event(event);
+
+	WARN_ON_ONCE(event->cpu != -1 &&
+		     topology_physical_package_id(event->cpu) != pkg_id);
+
+	/* Only perf_event leader can return a value, everybody else share
+	 * the same RMID.
+	 */
+	if (event->parent) {
+		local64_set(&event->count, 0);
+		return;
+	}
+
+	if (event->attach_state & PERF_ATTACH_TASK) {
+		__read_task_event(event);
+		return;
+	}
+
+	/* It's either a cgroup or a cpu event. */
+	if (WARN_ON_ONCE(event->cpu < 0))
+		return;
+
+	/* XXX: expose fail_on_inh_descendant as a configuration parameter? */
+	pmonr__read_subtree(monr, pkg_id, &count, false);
+
+	local64_set(&event->count, count);
+	return;
 }
 
 static inline void __intel_cqm_event_start(
