@@ -175,6 +175,7 @@ static int anode_pool__alloc_one(u16 pkg_id);
 /* Init cqm pkg_data for @cpu 's package. */
 static int pkg_data_init_cpu(int cpu)
 {
+	int i, nr_anodes;
 	struct pkg_data *pkg_data;
 	struct cpuinfo_x86 *c = &cpu_data(cpu);
 	u16 pkg_id = topology_physical_package_id(cpu);
@@ -238,6 +239,15 @@ static int pkg_data_init_cpu(int cpu)
 	pkg_data->timed_update_cpu = cpu;
 
 	cqm_pkgs_data[pkg_id] = pkg_data;
+
+	/* Pre-allocate pool with one anode more than minimum needed to contain
+	 * all the RMIDs in the package.
+	 */
+	nr_anodes = (pkg_data->max_rmid + NR_RMIDS_PER_NODE) /
+		NR_RMIDS_PER_NODE + 1;
+
+	for (i = 0; i < nr_anodes; i++)
+		anode_pool__alloc_one(pkg_id);
 	return 0;
 }
 
