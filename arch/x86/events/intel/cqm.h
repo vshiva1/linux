@@ -41,9 +41,71 @@ struct prmid {
 };
 
 /*
+ * struct pkg_data: Per-package CQM data.
+ * @max_rmid:			Max rmid valid for cpus in this package.
+ * @prmids_by_rmid:		Utility mapping between rmid values and prmids.
+ *				XXX: Make it an array of prmids.
+ * @free_prmid_pool:		Free prmids.
+ * @pkg_data_mutex:		Hold for stability when modifying pmonrs
+ *				hierarchy.
+ * @pkg_data_lock:		Hold to protect variables that may be accessed
+ *				during process scheduling. The locks for all
+ *				packages must be held when modifying the monr
+ *				hierarchy.
+ * @rotation_cpu:               CPU to run @rotation_work on, it must be in the
+ *                              package associated to this instance of pkg_data.
+ */
+struct pkg_data {
+	u32			max_rmid;
+	/* Quick map from rmids to prmids. */
+	struct prmid		**prmids_by_rmid;
+
+	/*
+	 * Pools of prmids used in rotation logic.
+	 */
+	struct list_head	free_prmids_pool;
+
+	struct mutex		pkg_data_mutex;
+	raw_spinlock_t		pkg_data_lock;
+
+	int			rotation_cpu;
+};
+
+extern struct pkg_data **cqm_pkgs_data;
+
+static inline u16 __cqm_pkgs_data_next_online(u16 pkg_id)
+{
+	while (!cqm_pkgs_data[++pkg_id] && pkg_id < topology_max_packages())
+		;
+	return pkg_id;
+}
+
+static inline u16 __cqm_pkgs_data_first_online(void)
+{
+	if (cqm_pkgs_data[0])
+		return 0;
+	return __cqm_pkgs_data_next_online(0);
+}
+
+/* Iterate for each online pkgs data */
+#define cqm_pkg_id_for_each_online(pkg_id__) \
+	for (pkg_id__ = __cqm_pkgs_data_first_online(); \
+	     pkg_id__ < topology_max_packages(); \
+	     pkg_id__ = __cqm_pkgs_data_next_online(pkg_id__))
+
+#define __pkg_data(pmonr, member) cqm_pkgs_data[pmonr->pkg_id]->member
+
+/*
  * Time between execution of rotation logic. The frequency of execution does
  * not affect the rate at which RMIDs are recycled, except by the delay by the
  * delay updating the prmid's and their pools.
  * The rotation period is stored in pmu->hrtimer_interval_ms.
  */
 #define CQM_DEFAULT_ROTATION_PERIOD 1200	/* ms */
+
+/*
+ * __intel_cqm_max_threshold provides an upper bound on the threshold,
+ * and is measured in bytes because it's exposed to userland.
+ * It's units are bytes must be scaled by cqm_l3_scale to obtain cache lines.
+ */
+static unsigned int __intel_cqm_max_threshold;

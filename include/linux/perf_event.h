@@ -118,6 +118,13 @@ struct hw_perf_event {
 			/* for tp_event->class */
 			struct list_head	tp_list;
 		};
+#ifdef CONFIG_INTEL_RDT
+		struct { /* intel_cqm */
+			void			*cqm_monr;
+			struct list_head	cqm_event_group_entry;
+			struct list_head	cqm_event_groups_entry;
+		};
+#endif
 		struct { /* itrace */
 			int			itrace_started;
 		};
