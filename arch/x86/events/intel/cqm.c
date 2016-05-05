@@ -72,6 +72,11 @@ static inline int __cqm_prmid_update(struct prmid *prmid,
 	return 1;
 }
 
+static inline int cqm_prmid_update(struct prmid *prmid)
+{
+	return __cqm_prmid_update(prmid, __rmid_min_update_time);
+}
+
 /*
  * A cache groups is a group of perf_events with the same target (thread,
  * cgroup, CPU or system-wide). Each cache group receives has one RMID.
@@ -80,7 +85,67 @@ static inline int __cqm_prmid_update(struct prmid *prmid,
 static LIST_HEAD(cache_groups);
 static DEFINE_MUTEX(cqm_mutex);
 
+struct monr *monr_hrchy_root;
+
 struct pkg_data **cqm_pkgs_data;
+
+static inline bool __pmonr__in_astate(struct pmonr *pmonr)
+{
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+	return pmonr->prmid;
+}
+
+static inline bool __pmonr__in_ustate(struct pmonr *pmonr)
+{
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+	return !pmonr->prmid;
+}
+
+static inline bool monr__is_root(struct monr *monr)
+{
+	return monr_hrchy_root == monr;
+}
+
+static inline bool monr__is_mon_active(struct monr *monr)
+{
+	return monr->flags & MONR_MON_ACTIVE;
+}
+
+static inline void __monr__set_summary_read_rmid(struct monr *monr, u32 rmid)
+{
+	int i;
+	struct pmonr *pmonr;
+	union prmid_summary summary;
+
+	monr_hrchy_assert_held_raw_spin_locks();
+
+	cqm_pkg_id_for_each_online(i) {
+		pmonr = monr->pmonrs[i];
+		WARN_ON_ONCE(!__pmonr__in_ustate(pmonr));
+		summary.value = atomic64_read(&pmonr->prmid_summary_atomic);
+		summary.read_rmid = rmid;
+		atomic64_set(&pmonr->prmid_summary_atomic, summary.value);
+	}
+}
+
+static inline void __monr__set_mon_active(struct monr *monr)
+{
+	monr_hrchy_assert_held_raw_spin_locks();
+	__monr__set_summary_read_rmid(monr, 0);
+	monr->flags |= MONR_MON_ACTIVE;
+}
+
+/*
+ * All pmonrs must be in (U)state.
+ * clearing MONR_MON_ACTIVE prevents (U)state prmids from transitioning
+ * to another state.
+ */
+static inline void __monr__clear_mon_active(struct monr *monr)
+{
+	monr_hrchy_assert_held_raw_spin_locks();
+	__monr__set_summary_read_rmid(monr, INVALID_RMID);
+	monr->flags &= ~MONR_MON_ACTIVE;
+}
 
 static inline bool __valid_pkg_id(u16 pkg_id)
 {
@@ -125,6 +190,10 @@ static int pkg_data_init_cpu(int cpu)
 	}
 
 	INIT_LIST_HEAD(&pkg_data->free_prmids_pool);
+	INIT_LIST_HEAD(&pkg_data->active_prmids_pool);
+	INIT_LIST_HEAD(&pkg_data->nopmonr_limbo_prmids_pool);
+
+	INIT_LIST_HEAD(&pkg_data->astate_pmonrs_lru);
 
 	mutex_init(&pkg_data->pkg_data_mutex);
 	raw_spin_lock_init(&pkg_data->pkg_data_lock);
@@ -136,12 +205,156 @@ static int pkg_data_init_cpu(int cpu)
 	return 0;
 }
 
+static inline bool __valid_rmid(u16 pkg_id, u32 rmid)
+{
+	return rmid <= cqm_pkgs_data[pkg_id]->max_rmid;
+}
+
+static inline bool __valid_prmid(u16 pkg_id, struct prmid *prmid)
+{
+	struct pkg_data *pkg_data = cqm_pkgs_data[pkg_id];
+	bool valid = __valid_rmid(pkg_id, prmid->rmid);
+
+	WARN_ON_ONCE(valid && pkg_data->prmids_by_rmid[
+			prmid->rmid]->rmid != prmid->rmid);
+	return valid;
+}
+
+static inline struct prmid *
+__prmid_from_rmid(u16 pkg_id, u32 rmid)
+{
+	struct prmid *prmid;
+
+	if (!__valid_rmid(pkg_id, rmid))
+		return NULL;
+	prmid = cqm_pkgs_data[pkg_id]->prmids_by_rmid[rmid];
+	WARN_ON_ONCE(!__valid_prmid(pkg_id, prmid));
+	return prmid;
+}
+
+static struct pmonr *pmonr_alloc(int cpu)
+{
+	struct pmonr *pmonr;
+	union prmid_summary summary;
+
+	pmonr = kmalloc_node(sizeof(struct pmonr),
+			     GFP_KERNEL, cpu_to_node(cpu));
+	if (!pmonr)
+		return ERR_PTR(-ENOMEM);
+
+	pmonr->prmid = NULL;
+
+	pmonr->monr = NULL;
+	INIT_LIST_HEAD(&pmonr->rotation_entry);
+
+	pmonr->pkg_id = topology_physical_package_id(cpu);
+	summary.sched_rmid = INVALID_RMID;
+	summary.read_rmid = INVALID_RMID;
+	atomic64_set(&pmonr->prmid_summary_atomic, summary.value);
+
+	return pmonr;
+}
+
+static void pmonr_dealloc(struct pmonr *pmonr)
+{
+	kfree(pmonr);
+}
+
+/*
+ * @root: Common ancestor.
+ * a bust be distinct to b.
+ * @true if a is ancestor of b.
+ */
+static inline bool
+__monr_hrchy_is_ancestor(struct monr *root,
+			 struct monr *a, struct monr *b)
+{
+	WARN_ON_ONCE(!root || !a || !b);
+	WARN_ON_ONCE(a == b);
+
+	if (root == a)
+		return true;
+	if (root == b)
+		return false;
+
+	b = b->parent;
+	/* Break at the root */
+	while (b != root) {
+		WARN_ON_ONCE(!b);
+		if (a == b)
+			return true;
+		b = b->parent;
+	}
+	return false;
+}
+
+/* helper function to finish transition to astate. */
+static inline void
+__pmonr__finish_to_astate(struct pmonr *pmonr, struct prmid *prmid)
+{
+	union prmid_summary summary;
+
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+
+	pmonr->prmid = prmid;
+
+	list_move_tail(
+		&prmid->pool_entry, &__pkg_data(pmonr, active_prmids_pool));
+	list_move_tail(
+		&pmonr->rotation_entry, &__pkg_data(pmonr, astate_pmonrs_lru));
+
+	summary.sched_rmid = pmonr->prmid->rmid;
+	summary.read_rmid = pmonr->prmid->rmid;
+	atomic64_set(&pmonr->prmid_summary_atomic, summary.value);
+}
+
+static inline void
+__pmonr__ustate_to_astate(struct pmonr *pmonr, struct prmid *prmid)
+{
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+	__pmonr__finish_to_astate(pmonr, prmid);
+}
+
+static inline void
+__pmonr__to_ustate(struct pmonr *pmonr)
+{
+	union prmid_summary summary;
+
+	lockdep_assert_held(&__pkg_data(pmonr, pkg_data_lock));
+
+	/* Do not warn on re-enter state for (U)state, to simplify cleanup
+	 * of initialized states that were not scheduled.
+	 */
+	if (__pmonr__in_ustate(pmonr))
+		return;
+
+	if (__pmonr__in_astate(pmonr)) {
+		WARN_ON_ONCE(!pmonr->prmid);
+
+		list_move_tail(&pmonr->prmid->pool_entry,
+			       &__pkg_data(pmonr, nopmonr_limbo_prmids_pool));
+		pmonr->prmid =  NULL;
+	} else {
+		WARN_ON_ONCE(true);
+		return;
+	}
+	list_del_init(&pmonr->rotation_entry);
+
+	summary.sched_rmid = INVALID_RMID;
+	summary.read_rmid  =
+		monr__is_mon_active(pmonr->monr) ? 0 : INVALID_RMID;
+
+	atomic64_set(&pmonr->prmid_summary_atomic, summary.value);
+	WARN_ON_ONCE(!__pmonr__in_ustate(pmonr));
+}
+
 static int intel_cqm_setup_pkg_prmid_pools(u16 pkg_id)
 {
 	int r;
 	unsigned long flags;
 	struct prmid *prmid;
 	struct pkg_data *pkg_data = cqm_pkgs_data[pkg_id];
+	struct pmonr *root_pmonr;
 
 	if (!__valid_pkg_id(pkg_id))
 		return -EINVAL;
@@ -163,8 +376,13 @@ static int intel_cqm_setup_pkg_prmid_pools(u16 pkg_id)
 			&pkg_data->pkg_data_lock, flags, pkg_id);
 		pkg_data->prmids_by_rmid[r] = prmid;
 
+		list_add_tail(&prmid->pool_entry, &pkg_data->free_prmids_pool);
 
 		/* RMID 0 is special and makes the root of rmid hierarchy. */
+		if (r == 0) {
+			root_pmonr = monr_hrchy_root->pmonrs[pkg_id];
+			__pmonr__ustate_to_astate(root_pmonr, prmid);
+		}
 		raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
 	}
 	return 0;
@@ -179,6 +397,238 @@ fail:
 	return -ENOMEM;
 }
 
+
+/* Alloc monr with all pmonrs in (U)state. */
+static struct monr *monr_alloc(void)
+{
+	int i;
+	struct pmonr *pmonr;
+	struct monr *monr;
+
+	monr = kmalloc(sizeof(struct monr), GFP_KERNEL);
+
+	if (!monr)
+		return ERR_PTR(-ENOMEM);
+
+	monr->flags = 0;
+	monr->parent = NULL;
+	INIT_LIST_HEAD(&monr->children);
+	INIT_LIST_HEAD(&monr->parent_entry);
+	monr->mon_event_group = NULL;
+
+	monr->pmonrs = kmalloc(
+		sizeof(struct pmonr *) * topology_max_packages(), GFP_KERNEL);
+
+	if (!monr->pmonrs)
+		return ERR_PTR(-ENOMEM);
+
+	/* Iterate over all pkgs, even unitialized ones. */
+	for (i = 0; i < topology_max_packages(); i++) {
+		/* Do not create pmonrs for unitialized packages. */
+		if (!cqm_pkgs_data[i]) {
+			monr->pmonrs[i] = NULL;
+			continue;
+		}
+		/* Rotation cpu is on pmonr's package. */
+		pmonr = pmonr_alloc(cqm_pkgs_data[i]->rotation_cpu);
+		if (IS_ERR(pmonr))
+			goto clean_pmonrs;
+		pmonr->monr = monr;
+		monr->pmonrs[i] = pmonr;
+	}
+	return monr;
+
+clean_pmonrs:
+	while (i--) {
+		if (cqm_pkgs_data[i])
+			kfree(monr->pmonrs[i]);
+	}
+	kfree(monr);
+	return ERR_CAST(pmonr);
+}
+
+/* Only can dealloc monrs with all pmonrs in (U)state. */
+static void monr_dealloc(struct monr *monr)
+{
+	int i;
+
+	cqm_pkg_id_for_each_online(i)
+		pmonr_dealloc(monr->pmonrs[i]);
+
+	kfree(monr);
+}
+
+/*
+ * Wrappers for monr manipulation in events.
+ *
+ */
+static inline struct monr *monr_from_event(struct perf_event *event)
+{
+	return (struct monr *) READ_ONCE(event->hw.cqm_monr);
+}
+
+static inline void event_set_monr(struct perf_event *event, struct monr *monr)
+{
+	WRITE_ONCE(event->hw.cqm_monr, monr);
+}
+
+/*
+ * Always finds a rmid_entry to schedule. To be called during scheduler.
+ * A fast path that only uses read_lock for common case when rmid for current
+ * package has been used before.
+ * On failure, verify that monr is active, if it is, try to obtain a free rmid
+ * and set pmonr to (A)state.
+ * On failure, transverse up monr_hrchy until finding one prmid for this
+ * pkg_id and set pmonr to (I)state.
+ * Called during task switch, it will set pmonr's prmid_summary to reflect the
+ * sched and read rmids that reflect pmonr's state.
+ */
+static inline void
+monr_hrchy_get_next_prmid_summary(struct pmonr *pmonr)
+{
+	union prmid_summary summary;
+
+	/*
+	 * First, do lock-free fastpath.
+	 */
+	summary.value = atomic64_read(&pmonr->prmid_summary_atomic);
+	if (summary.sched_rmid != INVALID_RMID)
+		return;
+
+	if (!prmid_summary__is_mon_active(summary))
+		return;
+
+	/*
+	 * Lock-free path failed at first attempt. Now acquire lock and repeat
+	 * in case the monr was modified in the mean time.
+	 * This time try to obtain free rmid and update pmonr accordingly,
+	 * instead of failing fast.
+	 */
+	raw_spin_lock_nested(&__pkg_data(pmonr, pkg_data_lock), pmonr->pkg_id);
+
+	summary.value = atomic64_read(&pmonr->prmid_summary_atomic);
+	if (summary.sched_rmid != INVALID_RMID) {
+		raw_spin_unlock(&__pkg_data(pmonr, pkg_data_lock));
+		return;
+	}
+
+	/* Do not try to obtain RMID if monr is not active. */
+	if (!prmid_summary__is_mon_active(summary)) {
+		raw_spin_unlock(&__pkg_data(pmonr, pkg_data_lock));
+		return;
+	}
+
+	/*
+	 * Can only fail if it was in (U)state.
+	 * Try to obtain a free prmid and go to (A)state, if not possible,
+	 * it should go to (I)state.
+	 */
+	WARN_ON_ONCE(!__pmonr__in_ustate(pmonr));
+
+	if (list_empty(&__pkg_data(pmonr, free_prmids_pool))) {
+		/* Failed to obtain an valid rmid in this package for this
+		 * monr. In next patches it will transition to (I)state.
+		 * For now, stay in (U)state (do nothing).
+		 */
+	} else {
+		/* Transition to (A)state using free prmid. */
+		__pmonr__ustate_to_astate(
+			pmonr,
+			list_first_entry(&__pkg_data(pmonr, free_prmids_pool),
+				struct prmid, pool_entry));
+	}
+	raw_spin_unlock(&__pkg_data(pmonr, pkg_data_lock));
+}
+
+static inline void __assert_monr_is_leaf(struct monr *monr)
+{
+	int i;
+
+	monr_hrchy_assert_held_mutexes();
+	monr_hrchy_assert_held_raw_spin_locks();
+
+	cqm_pkg_id_for_each_online(i)
+		WARN_ON_ONCE(!__pmonr__in_ustate(monr->pmonrs[i]));
+
+	WARN_ON_ONCE(!list_empty(&monr->children));
+}
+
+static inline void
+__monr_hrchy_insert_leaf(struct monr *monr, struct monr *parent)
+{
+	monr_hrchy_assert_held_mutexes();
+	monr_hrchy_assert_held_raw_spin_locks();
+
+	__assert_monr_is_leaf(monr);
+
+	list_add_tail(&monr->parent_entry, &parent->children);
+	monr->parent = parent;
+}
+
+static inline void
+__monr_hrchy_remove_leaf(struct monr *monr)
+{
+	/* Since root cannot be removed, monr must have a parent */
+	WARN_ON_ONCE(!monr->parent);
+
+	monr_hrchy_assert_held_mutexes();
+	monr_hrchy_assert_held_raw_spin_locks();
+
+	__assert_monr_is_leaf(monr);
+
+	list_del_init(&monr->parent_entry);
+	monr->parent = NULL;
+}
+
+static int __monr_hrchy_attach_cpu_event(struct perf_event *event)
+{
+	lockdep_assert_held(&cqm_mutex);
+	WARN_ON_ONCE(monr_from_event(event));
+
+	event_set_monr(event, monr_hrchy_root);
+	return 0;
+}
+
+/* task events are always leaves in the monr_hierarchy */
+static int __monr_hrchy_attach_task_event(struct perf_event *event,
+					  struct monr *parent_monr)
+{
+	struct monr *monr;
+	unsigned long flags;
+	int i;
+
+	lockdep_assert_held(&cqm_mutex);
+
+	monr = monr_alloc();
+	if (IS_ERR(monr))
+		return PTR_ERR(monr);
+	event_set_monr(event, monr);
+	monr->mon_event_group = event;
+
+	monr_hrchy_acquire_locks(flags, i);
+	__monr_hrchy_insert_leaf(monr, parent_monr);
+	__monr__set_mon_active(monr);
+	monr_hrchy_release_locks(flags, i);
+
+	return 0;
+}
+
+/*
+ * Find appropriate position in hierarchy and set monr. Create new
+ * monr if necessary.
+ * Locks rmid hrchy.
+ */
+static int monr_hrchy_attach_event(struct perf_event *event)
+{
+	struct monr *monr_parent;
+
+	if (!event->cgrp && !(event->attach_state & PERF_ATTACH_TASK))
+		return __monr_hrchy_attach_cpu_event(event);
+
+	/* Two-levels hierarchy: Root and all event monr underneath it. */
+	monr_parent = monr_hrchy_root;
+	return __monr_hrchy_attach_task_event(event, monr_parent);
+}
 
 /*
  * Determine if @a and @b measure the same set of tasks.
@@ -228,42 +678,105 @@ static int
 intel_cqm_setup_event(struct perf_event *event, struct perf_event **group)
 {
 	struct perf_event *iter;
+	struct monr *monr;
+	*group = NULL;
 
+	lockdep_assert_held(&cqm_mutex);
 
 	list_for_each_entry(iter, &cache_groups, hw.cqm_event_groups_entry) {
+		monr = monr_from_event(iter);
 		if (__match_event(iter, event)) {
+			/* All tasks in a group share an monr. */
+			event_set_monr(event, monr);
 			*group = iter;
 			return 0;
 		}
 	}
-	return 0;
+	/*
+	 * Since no match was found, create a new monr and set this
+	 * event as head of a new cache group. All events in this cache group
+	 * will share the monr.
+	 */
+	return monr_hrchy_attach_event(event);
 }
 
 /* Read current package immediately and remote pkg (if any) from cache. */
 static void intel_cqm_event_read(struct perf_event *event)
 {
+	union prmid_summary summary;
+	struct prmid *prmid;
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+	struct pmonr *pmonr = monr_from_event(event)->pmonrs[pkg_id];
+
+	summary.value = atomic64_read(&pmonr->prmid_summary_atomic);
+	prmid = __prmid_from_rmid(pkg_id, summary.read_rmid);
+	cqm_prmid_update(prmid);
+	local64_set(&event->count, atomic64_read(&prmid->last_read_value));
 }
 
-static void intel_cqm_event_start(struct perf_event *event, int mode)
+static inline void __intel_cqm_event_start(
+	struct perf_event *event, union prmid_summary summary)
 {
 	if (!(event->hw.state & PERF_HES_STOPPED))
 		return;
 
 	event->hw.state &= ~PERF_HES_STOPPED;
+	pqr_update_rmid(summary.sched_rmid);
+}
+
+static void intel_cqm_event_start(struct perf_event *event, int mode)
+{
+	union prmid_summary summary;
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+	struct pmonr *pmonr = monr_from_event(event)->pmonrs[pkg_id];
+
+	/* Utilize most up to date pmonr summary. */
+	monr_hrchy_get_next_prmid_summary(pmonr);
+	summary.value = atomic64_read(&pmonr->prmid_summary_atomic);
+	__intel_cqm_event_start(event, summary);
 }
 
 static void intel_cqm_event_stop(struct perf_event *event, int mode)
 {
+	union prmid_summary summary;
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+	struct pmonr *root_pmonr = monr_hrchy_root->pmonrs[pkg_id];
+
 	if (event->hw.state & PERF_HES_STOPPED)
 		return;
 
 	event->hw.state |= PERF_HES_STOPPED;
+
+	summary.value = atomic64_read(&root_pmonr->prmid_summary_atomic);
+	/* Occupancy of CQM events is obtained at read. No need to read
+	 * when event is stopped since read on inactive cpus succeed.
+	 */
+	pqr_update_rmid(summary.sched_rmid);
 }
 
 static int intel_cqm_event_add(struct perf_event *event, int mode)
 {
+	struct monr *monr;
+	struct pmonr *pmonr;
+	union prmid_summary summary;
+	u16 pkg_id = topology_physical_package_id(smp_processor_id());
+
+	monr = monr_from_event(event);
+	pmonr = monr->pmonrs[pkg_id];
+
 	event->hw.state = PERF_HES_STOPPED;
 
+	/* Utilize most up to date pmonr summary. */
+	monr_hrchy_get_next_prmid_summary(pmonr);
+	summary.value = atomic64_read(&pmonr->prmid_summary_atomic);
+
+	if (!prmid_summary__is_mon_active(summary))
+		return -1;
+
+	if (mode & PERF_EF_START)
+		__intel_cqm_event_start(event, summary);
+
+	/* (I)state pmonrs cannot report occupancy for themselves. */
 	return 0;
 }
 
@@ -275,6 +788,9 @@ static inline bool cqm_group_leader(struct perf_event *event)
 static void intel_cqm_event_destroy(struct perf_event *event)
 {
 	struct perf_event *group_other = NULL;
+	struct monr *monr;
+	int i;
+	unsigned long flags;
 
 	mutex_lock(&cqm_mutex);
 	/*
@@ -292,12 +808,15 @@ static void intel_cqm_event_destroy(struct perf_event *event)
 	if (!cqm_group_leader(event))
 		goto exit;
 
+	monr = monr_from_event(event);
+
 	/*
 	 * If there was a group_other, make that leader, otherwise
 	 * destroy the group and return the RMID.
 	 */
 	if (group_other) {
 		/* Update monr reference to group head. */
+		monr->mon_event_group = group_other;
 		list_replace(&event->hw.cqm_event_groups_entry,
 			     &group_other->hw.cqm_event_groups_entry);
 		goto exit;
@@ -307,8 +826,24 @@ static void intel_cqm_event_destroy(struct perf_event *event)
 	 * Event is the only event in cache group.
 	 */
 
+	event_set_monr(event, NULL);
 	list_del(&event->hw.cqm_event_groups_entry);
 
+	if (monr__is_root(monr))
+		goto exit;
+
+	/* Transition all pmonrs to (U)state. */
+	monr_hrchy_acquire_locks(flags, i);
+
+	cqm_pkg_id_for_each_online(i)
+		__pmonr__to_ustate(monr->pmonrs[i]);
+
+	__monr__clear_mon_active(monr);
+	monr->mon_event_group = NULL;
+	__monr_hrchy_remove_leaf(monr);
+	monr_hrchy_release_locks(flags, i);
+
+	monr_dealloc(monr);
 exit:
 	mutex_unlock(&cqm_mutex);
 }
@@ -562,6 +1097,12 @@ static int __init intel_cqm_init(void)
 			goto error;
 	}
 
+	monr_hrchy_root = monr_alloc();
+	if (IS_ERR(monr_hrchy_root)) {
+		ret = PTR_ERR(monr_hrchy_root);
+		goto error;
+	}
+
 	/* Select the minimum of the maximum rmids to use as limit for
 	 * threshold. XXX: per-package threshold.
 	 */
@@ -570,6 +1111,7 @@ static int __init intel_cqm_init(void)
 			min_max_rmid = cqm_pkgs_data[i]->max_rmid;
 		intel_cqm_setup_pkg_prmid_pools(i);
 	}
+	monr_hrchy_root->flags |= MONR_MON_ACTIVE;
 
 	/*
 	 * A reasonable upper limit on the max threshold is the number

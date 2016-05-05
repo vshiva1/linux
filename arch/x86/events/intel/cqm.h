@@ -41,11 +41,117 @@ struct prmid {
 };
 
 /*
+ * Minimum time elapsed between reads of occupancy value for an RMID when
+ * transversing the monr hierarchy.
+ */
+#define RMID_DEFAULT_MIN_UPDATE_TIME 20	/* ms */
+static unsigned int __rmid_min_update_time = RMID_DEFAULT_MIN_UPDATE_TIME;
+
+static inline int cqm_prmid_update(struct prmid *prmid);
+
+/*
+ * union prmid_summary: Machine-size summary of a pmonr's prmid state.
+ * @value:		One word accesor.
+ * @rmid:		rmid for prmid.
+ * @sched_rmid:		The rmid to write in the PQR MSR.
+ * @read_rmid:		The rmid to read occupancy from.
+ *
+ * The prmid_summarys are read atomically and without the need of LOCK
+ * instructions during event and group scheduling in task context switch.
+ * They are set when a prmid change state and allow lock-free fast paths for
+ * RMID scheduling and RMID read for the common case when prmid does not need
+ * to change state.
+ * The combination of values in sched_rmid and read_rmid indicate the state of
+ * the associated pmonr (see pmonr comments) as follows:
+ *					pmonr state
+ *	      |	 (A)state	    (U)state
+ * ----------------------------------------------------------------------------
+ * sched_rmid |	pmonr.prmid	   INVALID_RMID
+ *  read_rmid |	pmonr.prmid	   INVALID_RMID
+ *				      (or 0)
+ *
+ * The combination sched_rmid == INVALID_RMID and read_rmid == 0 for (U)state
+ * denotes that the flag MONR_MON_ACTIVE is set in the monr associated with
+ * the pmonr for this prmid_summary.
+ */
+union prmid_summary {
+	long long	value;
+	struct {
+		u32	sched_rmid;
+		u32	read_rmid;
+	};
+};
+
+/* A pmonr in (U)state has no sched_rmid, read_rmid can be 0 or INVALID_RMID
+ * depending on whether monitoring is active or not.
+ */
+inline bool prmid_summary__is_ustate(union prmid_summary summ)
+{
+	return summ.sched_rmid == INVALID_RMID;
+}
+
+inline bool prmid_summary__is_mon_active(union prmid_summary summ)
+{
+	/* If not in (U)state, then MONR_MON_ACTIVE must be set. */
+	return summ.sched_rmid != INVALID_RMID ||
+	       summ.read_rmid == 0;
+}
+
+struct monr;
+
+/* struct pmonr: Node of per-package hierarchy of MONitored Resources.
+ * @prmid:			The prmid of this pmonr -when in (A)state-.
+ * @rotation_entry:		List entry to attach to pmonr rotation lists in
+ *				pkg_data.
+ * @monr:			The monr that contains this pmonr.
+ * @pkg_id:			Auxiliar variable with pkg id for this pmonr.
+ * @prmid_summary_atomic:	Atomic accesor to store a union prmid_summary
+ *				that represent the state of this pmonr.
+ *
+ * A pmonr forms a per-package hierarchy of prmids. Each one represents a
+ * resource to be monitored and can hold a prmid. Due to rmid scarcity,
+ * rmids can be recycled and rotated. When a rmid is not available for this
+ * pmonr, the pmonr utilizes the rmid of its ancestor.
+ * A pmonr is always in one of the following states:
+ *   - (A)ctive:	Has @prmid assigned, @ancestor_pmonr must be NULL.
+ *   - (U)nused:	No @ancestor_pmonr and no @prmid, hence no available
+ *			prmid and no inhering one either. Not in rotation list.
+ *			This state is unschedulable and a prmid
+ *			should be found (either o free one or ancestor's) before
+ *			scheduling a thread with (U)state pmonr in
+ *			a cpu in this package.
+ *
+ * The state transitions are:
+ *   (U) : The initial state. Starts there after allocation.
+ *   (U) -> (A): If on first sched (or initialization) pmonr receives a prmid.
+ *   (A) -> (U): On destruction of monr.
+ *
+ * Each pmonr is contained by a monr.
+ */
+struct pmonr {
+
+	struct prmid				*prmid;
+
+	struct monr				*monr;
+	struct list_head			rotation_entry;
+
+	u16					pkg_id;
+
+	/* all writers are sync'ed by package's lock. */
+	atomic64_t				prmid_summary_atomic;
+};
+
+/*
  * struct pkg_data: Per-package CQM data.
  * @max_rmid:			Max rmid valid for cpus in this package.
  * @prmids_by_rmid:		Utility mapping between rmid values and prmids.
  *				XXX: Make it an array of prmids.
  * @free_prmid_pool:		Free prmids.
+ * @active_prmid_pool:		prmids associated with a (A)state pmonr.
+ * @nopmonr_limbo_prmid_pool:	prmids in limbo state that are not referenced
+ *				by a pmonr.
+ * @astate_pmonrs_lru:		pmonrs in (A)state. LRU in increasing order of
+ *				pmonr.last_enter_astate.
  * @pkg_data_mutex:		Hold for stability when modifying pmonrs
  *				hierarchy.
  * @pkg_data_lock:		Hold to protect variables that may be accessed
@@ -64,12 +170,64 @@ struct pkg_data {
 	 * Pools of prmids used in rotation logic.
 	 */
 	struct list_head	free_prmids_pool;
+	/* Can be modified during task switch with (U)state -> (A)state. */
+	struct list_head	active_prmids_pool;
+	/* Only modified during rotation logic and deletion. */
+	struct list_head	nopmonr_limbo_prmids_pool;
+
+	struct list_head	astate_pmonrs_lru;
 
 	struct mutex		pkg_data_mutex;
 	raw_spinlock_t		pkg_data_lock;
 
 	int			rotation_cpu;
 };
+
+/*
+ * Flags for monr.
+ */
+#define MONR_MON_ACTIVE		0x1
+
+/*
+ * struct monr: MONitored Resource.
+ * @flags:		Flags field for monr (XXX: More flags will be added
+ *			with MBM).
+ * @mon_event_group:	The head of event's group that use this monr, if any.
+ * @parent:		Parent in monr hierarchy.
+ * @children:		List of children in monr hierarchy.
+ * @parent_entry:	Entry in parent's children list.
+ * @pmonrs:		Per-package pmonr for this monr.
+ *
+ * Each cgroup or thread that requires a RMID will have a corresponding
+ * monr in the system-wide hierarchy reflecting it's position in the
+ * cgroup/thread hierarchy.
+ * An monr is assigned to every CQM event and/or monitored cgroups when
+ * monitoring is activated and that instance's address do not change during
+ * the lifetime of the event or cgroup.
+ *
+ * On creation, the monr has flags cleared and all its pmonrs in (U)state.
+ * The flag MONR_MON_ACTIVE must be set to enable any transition out of
+ * (U)state to occur.
+ */
+struct monr {
+	u16				flags;
+	/* Back reference pointers */
+	struct perf_event		*mon_event_group;
+
+	struct monr			*parent;
+	struct list_head		children;
+	struct list_head		parent_entry;
+	struct pmonr			**pmonrs;
+};
+
+/*
+ * Root for system-wide hierarchy of monr.
+ * A per-package raw_spin_lock protects changes to the per-pkg elements of
+ * the monr hierarchy.
+ * To modify the monr hierarchy, must hold all locks in each package
+ * using packaged-id as nesting parameter.
+ */
+extern struct monr *monr_hrchy_root;
 
 extern struct pkg_data **cqm_pkgs_data;
 
