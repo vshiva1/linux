@@ -96,6 +96,84 @@ static inline u16 __cqm_pkgs_data_first_online(void)
 #define __pkg_data(pmonr, member) cqm_pkgs_data[pmonr->pkg_id]->member
 
 /*
+ * Utility function and macros to manage per-package locks.
+ * Use macros to keep flags in caller's stace.
+ * Hold lock in all the packages, required to alter the monr hierarchy
+ */
+static inline void monr_hrchy_acquire_mutexes(void)
+{
+	int i;
+
+	cqm_pkg_id_for_each_online(i)
+		mutex_lock_nested(&cqm_pkgs_data[i]->pkg_data_mutex, i);
+}
+
+# define monr_hrchy_acquire_raw_spin_locks_irq_save(flags, i) \
+	do { \
+		raw_local_irq_save(flags); \
+		cqm_pkg_id_for_each_online(i) {\
+			raw_spin_lock_nested( \
+				&cqm_pkgs_data[i]->pkg_data_lock, i); \
+		} \
+	} while (0)
+
+#define monr_hrchy_acquire_locks(flags, i) \
+	do {\
+		monr_hrchy_acquire_mutexes(); \
+		monr_hrchy_acquire_raw_spin_locks_irq_save(flags, i); \
+	} while (0)
+
+static inline void monr_hrchy_release_mutexes(void)
+{
+	int i;
+
+	cqm_pkg_id_for_each_online(i)
+		mutex_unlock(&cqm_pkgs_data[i]->pkg_data_mutex);
+}
+
+# define monr_hrchy_release_raw_spin_locks_irq_restore(flags, i) \
+	do { \
+		cqm_pkg_id_for_each_online(i) {\
+			raw_spin_unlock(&cqm_pkgs_data[i]->pkg_data_lock); \
+		} \
+		raw_local_irq_restore(flags); \
+	} while (0)
+
+#define monr_hrchy_release_locks(flags, i) \
+	do {\
+		monr_hrchy_release_raw_spin_locks_irq_restore(flags, i); \
+		monr_hrchy_release_mutexes(); \
+	} while (0)
+
+static inline void monr_hrchy_assert_held_mutexes(void)
+{
+	int i;
+
+	cqm_pkg_id_for_each_online(i)
+		lockdep_assert_held(&cqm_pkgs_data[i]->pkg_data_mutex);
+}
+
+static inline void monr_hrchy_assert_held_raw_spin_locks(void)
+{
+	int i;
+
+	cqm_pkg_id_for_each_online(i)
+		lockdep_assert_held(&cqm_pkgs_data[i]->pkg_data_lock);
+}
+#ifdef CONFIG_LOCKDEP
+static inline int monr_hrchy_count_held_raw_spin_locks(void)
+{
+	int i, nr_held = 0;
+
+	cqm_pkg_id_for_each_online(i) {
+		if (lockdep_is_held(&cqm_pkgs_data[i]->pkg_data_lock))
+			nr_held++;
+	}
+	return nr_held;
+}
+#endif
+
+/*
  * Time between execution of rotation logic. The frequency of execution does
  * not affect the rate at which RMIDs are recycled, except by the delay by the
  * delay updating the prmid's and their pools.
