@@ -23,6 +23,24 @@
 #include <asm/topology.h>
 
 /*
+ * struct prmid: Package RMID. Per-package wrapper for a rmid.
+ * @last_read_value:	Least read value.
+ * @last_read_time:	Time last read, used when throtling read rate.
+ * @pool_entry:		Attaches to a prmid pool in cqm_pkg_data.
+ * @rmid:		The rmid value to be programed in hardware.
+ *
+ * Its accesors ensure that CQM events for this rmid are read atomically and
+ * allow to throtle the frequency of reads to up to one each
+ * __rmid_min_update_time ms.
+ */
+struct prmid {
+	atomic64_t		last_read_value;
+	atomic64_t		last_read_time;
+	struct list_head	pool_entry;
+	u32			rmid;
+};
+
+/*
  * Time between execution of rotation logic. The frequency of execution does
  * not affect the rate at which RMIDs are recycled, except by the delay by the
  * delay updating the prmid's and their pools.
