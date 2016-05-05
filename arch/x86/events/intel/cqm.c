@@ -222,6 +222,8 @@ static int pkg_data_init_cpu(int cpu)
 	mutex_init(&pkg_data->pkg_data_mutex);
 	raw_spin_lock_init(&pkg_data->pkg_data_lock);
 
+	INIT_DELAYED_WORK(
+		&pkg_data->rotation_work, intel_cqm_rmid_rotation_work);
 	/* XXX: Chose randomly*/
 	pkg_data->rotation_cpu = cpu;
 
@@ -1384,7 +1386,7 @@ read_nr_instate_pmonrs(struct pkg_data *pkg_data, u16 pkg_id) {
  * this point we can start reading values for the new RMID and treat the
  * old RMID as the free RMID for the next rotation.
  */
-void
+static void
 __intel_cqm_rmid_rotate(struct pkg_data *pkg_data,
 			unsigned int nr_max_limbo,
 			unsigned int nr_min_activated)
@@ -1518,6 +1520,70 @@ exit:
 }
 
 static struct pmu intel_cqm_pmu;
+
+/* Rotation only needs to be run when there is any pmonr in (I)state. */
+static bool intel_cqm_need_rotation(u16 pkg_id)
+{
+
+	struct pkg_data *pkg_data;
+	bool need_rot;
+
+	pkg_data = cqm_pkgs_data[pkg_id];
+
+	mutex_lock_nested(&pkg_data->pkg_data_mutex, pkg_id);
+	/* Rotation is needed if prmids in limbo need to be recycled or if
+	 * there are pmonrs in (I)state.
+	 */
+	need_rot = !list_empty(&pkg_data->nopmonr_limbo_prmids_pool) ||
+		   !list_empty(&pkg_data->istate_pmonrs_lru);
+
+	mutex_unlock(&pkg_data->pkg_data_mutex);
+	return need_rot;
+}
+
+/*
+ * Schedule rotation in one package.
+ */
+static void __intel_cqm_schedule_rotation_for_pkg(u16 pkg_id)
+{
+	struct pkg_data *pkg_data;
+	unsigned long delay;
+
+	delay = msecs_to_jiffies(intel_cqm_pmu.hrtimer_interval_ms);
+	pkg_data = cqm_pkgs_data[pkg_id];
+	schedule_delayed_work_on(
+		pkg_data->rotation_cpu, &pkg_data->rotation_work, delay);
+}
+
+/*
+ * Schedule rotation and rmid's timed update in all packages.
+ * Reescheduling will stop when no longer needed.
+ */
+static void intel_cqm_schedule_work_all_pkgs(void)
+{
+	int pkg_id;
+
+	cqm_pkg_id_for_each_online(pkg_id)
+		__intel_cqm_schedule_rotation_for_pkg(pkg_id);
+}
+
+static void intel_cqm_rmid_rotation_work(struct work_struct *work)
+{
+	struct pkg_data *pkg_data = container_of(
+		to_delayed_work(work), struct pkg_data, rotation_work);
+	/* Allow max 25% of RMIDs to be in limbo. */
+	unsigned int max_limbo_rmids = max(1u, (pkg_data->max_rmid + 1) / 4);
+	unsigned int min_activated = max(1u, (intel_cqm_pmu.hrtimer_interval_ms
+		* __cqm_min_progress_rate) / 1000);
+	u16 pkg_id = topology_physical_package_id(pkg_data->rotation_cpu);
+
+	WARN_ON_ONCE(pkg_data != cqm_pkgs_data[pkg_id]);
+
+	__intel_cqm_rmid_rotate(pkg_data, max_limbo_rmids, min_activated);
+
+	if (intel_cqm_need_rotation(pkg_id))
+		__intel_cqm_schedule_rotation_for_pkg(pkg_id);
+}
 
 /*
  * Find a group and setup RMID.
@@ -1743,6 +1809,8 @@ static int intel_cqm_event_init(struct perf_event *event)
 	}
 
 	mutex_unlock(&cqm_mutex);
+
+	intel_cqm_schedule_work_all_pkgs();
 
 	return 0;
 }

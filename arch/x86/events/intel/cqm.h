@@ -239,6 +239,7 @@ struct pmonr {
  *				during process scheduling. The locks for all
  *				packages must be held when modifying the monr
  *				hierarchy.
+ * @rotation_work:		Task that performs rotation of prmids.
  * @rotation_cpu:               CPU to run @rotation_work on, it must be in the
  *                              package associated to this instance of pkg_data.
  */
@@ -268,6 +269,7 @@ struct pkg_data {
 	struct mutex		pkg_data_mutex;
 	raw_spinlock_t		pkg_data_lock;
 
+	struct delayed_work	rotation_work;
 	int			rotation_cpu;
 };
 
@@ -428,6 +430,18 @@ static inline int monr_hrchy_count_held_raw_spin_locks(void)
 #define CQM_DEFAULT_ROTATION_PERIOD 1200	/* ms */
 
 /*
+ * Rotation function.
+ * Rotation logic runs per-package. In each package, if free rmids are needed,
+ * it will steal prmids from the pmonr that has been the longest time in
+ * (A)state.
+ * The hardware provides to way to signal that a rmid will be reused, therefore,
+ * before reusing a rmid that has been stolen, the rmid should stay for some
+ * in a "limbo" state where is not associated to any thread, hoping that the
+ * cache lines allocated for this rmid will eventually be replaced.
+ */
+static void intel_cqm_rmid_rotation_work(struct work_struct *work);
+
+/*
  * Service Level Objectives (SLO) for the rotation logic.
  *
  * @__cqm_min_duration_mon_slice: Minimum duration of a monitored slice.
@@ -442,6 +456,13 @@ static unsigned int __cqm_min_mon_slice = CQM_DEFAULT_MIN_MON_SLICE;
 
 #define CQM_DEFAULT_MAX_WAIT_MON 20000 /* ms */
 static unsigned int __cqm_max_wait_mon = CQM_DEFAULT_MAX_WAIT_MON;
+
+/*
+ * Minimum numbers of pmonrs that must go to Active state per second in order
+ * to consider rotation to be effective.
+ */
+#define CQM_DEFAULT_MIN_PROGRESS_RATE 1
+static unsigned int __cqm_min_progress_rate = CQM_DEFAULT_MIN_PROGRESS_RATE;
 
 /*
  * If we fail to assign any RMID for intel_cqm_rotation because cachelines are
