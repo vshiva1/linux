@@ -26,8 +26,10 @@ enum intel_pqr_rmid_mode {
 /**
  * struct intel_pqr_state - State cache for the PQR MSR
  * @rmid:		Last RMID written to hw.
+ * @next_rmid:		Next RMID to write to hw.
  * @rmid_mode:		Next RMID's mode.
  * @closid:		The current Class Of Service ID
+ * @next_closid:	The Class Of Service ID to use.
  *
  * The upper 32 bits of MSR_IA32_PQR_ASSOC contain closid and the
  * lower 10 bits rmid. The update to MSR_IA32_PQR_ASSOC always
@@ -39,22 +41,27 @@ enum intel_pqr_rmid_mode {
  */
 struct intel_pqr_state {
 	u32				rmid;
-	enum intel_pqr_rmid_mode	rmid_mode;
+	u32				next_rmid;
+	enum intel_pqr_rmid_mode	next_rmid_mode;
 	u32				closid;
+	u32				next_closid;
 };
 
 DECLARE_PER_CPU(struct intel_pqr_state, pqr_state);
 
-static inline void pqr_update_rmid(u32 rmid, enum intel_pqr_rmid_mode mode)
+static inline void pqr_cache_update_rmid(u32 rmid, enum intel_pqr_rmid_mode mode)
 {
 	struct intel_pqr_state *state = this_cpu_ptr(&pqr_state);
 
-	state->rmid_mode = mode;
+	state->next_rmid_mode = mode;
+	state->next_rmid = rmid;
+}
 
-	if (state->rmid == rmid)
-		return;
-	state->rmid = rmid;
-	wrmsr(MSR_IA32_PQR_ASSOC, rmid, state->closid);
+static inline void pqr_cache_update_closid(u32 closid)
+{
+	struct intel_pqr_state *state = this_cpu_ptr(&pqr_state);
+
+	state->next_closid = closid;
 }
 
 void __pqr_ctx_switch(void);

@@ -19,6 +19,15 @@ inline void __pqr_ctx_switch(void)
 	/* If perf_event did set rmid that is used, do not try
 	 * to obtain another one from current task.
 	 */
-	if (state->rmid_mode == PQR_RMID_MODE_NOEVENT)
+	if (state->next_rmid_mode == PQR_RMID_MODE_NOEVENT)
 		__intel_cqm_no_event_sched_in();
+
+	/* __intel_cqm_no_event_sched_in might have changed next_rmid. */
+	if (state->rmid == state->next_rmid &&
+	    state->closid == state->next_closid)
+		return;
+
+	state->rmid = state->next_rmid;
+	state->closid = state->next_closid;
+	wrmsr(MSR_IA32_PQR_ASSOC, state->rmid, state->closid);
 }

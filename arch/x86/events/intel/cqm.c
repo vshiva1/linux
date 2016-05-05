@@ -2515,7 +2515,7 @@ static inline void __intel_cqm_event_start(
 	if (!(event->hw.state & PERF_HES_STOPPED))
 		return;
 	event->hw.state &= ~PERF_HES_STOPPED;
-	pqr_update_rmid(summary.sched_rmid, PQR_RMID_MODE_EVENT);
+	pqr_cache_update_rmid(summary.sched_rmid, PQR_RMID_MODE_EVENT);
 }
 
 static void intel_cqm_event_start(struct perf_event *event, int mode)
@@ -2545,7 +2545,7 @@ static void intel_cqm_event_stop(struct perf_event *event, int mode)
 	/* Occupancy of CQM events is obtained at read. No need to read
 	 * when event is stopped since read on inactive cpus succeed.
 	 */
-	pqr_update_rmid(summary.sched_rmid, PQR_RMID_MODE_NOEVENT);
+	pqr_cache_update_rmid(summary.sched_rmid, PQR_RMID_MODE_NOEVENT);
 }
 
 static int intel_cqm_event_add(struct perf_event *event, int mode)
@@ -2962,8 +2962,10 @@ static void intel_cqm_cpu_starting(unsigned int cpu)
 	u16 pkg_id = topology_physical_package_id(cpu);
 
 	state->rmid = 0;
-	state->rmid_mode = PQR_RMID_MODE_NOEVENT;
+	state->next_rmid = 0;
+	state->next_rmid_mode = PQR_RMID_MODE_NOEVENT;
 	state->closid = 0;
+	state->next_closid = 0;
 
 	/* XXX: lock */
 	/* XXX: Make sure this case is handled when hotplug happens. */
@@ -3190,12 +3192,12 @@ inline void __intel_cqm_no_event_sched_in(void)
 	if (WARN_ON_ONCE(!__valid_rmid(pkg_id, summary.sched_rmid)))
 		goto no_rmid;
 
-	pqr_update_rmid(summary.sched_rmid, PQR_RMID_MODE_NOEVENT);
+	pqr_cache_update_rmid(summary.sched_rmid, PQR_RMID_MODE_NOEVENT);
 	return;
 
 no_rmid:
 	summary.value = atomic64_read(&root_pmonr->prmid_summary_atomic);
-	pqr_update_rmid(summary.sched_rmid, PQR_RMID_MODE_NOEVENT);
+	pqr_cache_update_rmid(summary.sched_rmid, PQR_RMID_MODE_NOEVENT);
 #endif
 }
 
