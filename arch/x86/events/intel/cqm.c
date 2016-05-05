@@ -393,9 +393,57 @@ static struct attribute_group intel_cqm_format_group = {
 	.attrs = intel_cqm_formats_attr,
 };
 
+static ssize_t
+max_recycle_threshold_show(
+	struct device *dev, struct device_attribute *attr, char *page)
+{
+	ssize_t rv;
+
+	monr_hrchy_acquire_mutexes();
+	rv = snprintf(page, PAGE_SIZE - 1, "%u\n",
+		      __intel_cqm_max_threshold);
+	monr_hrchy_release_mutexes();
+
+	return rv;
+}
+
+static ssize_t
+max_recycle_threshold_store(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	unsigned int bytes;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &bytes);
+	if (ret)
+		return ret;
+
+	/* Mutex waits for rotation logic in all packages to complete. */
+	monr_hrchy_acquire_mutexes();
+
+	__intel_cqm_max_threshold = bytes;
+
+	monr_hrchy_release_mutexes();
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(max_recycle_threshold);
+
+static struct attribute *intel_cqm_attrs[] = {
+	&dev_attr_max_recycle_threshold.attr,
+	NULL,
+};
+
+static const struct attribute_group intel_cqm_group = {
+	.attrs = intel_cqm_attrs,
+};
+
 static const struct attribute_group *intel_cqm_attr_groups[] = {
 	&intel_cqm_events_group,
 	&intel_cqm_format_group,
+	&intel_cqm_group,
 	NULL,
 };
 
