@@ -12,7 +12,7 @@
 /*
  * Defines x86 CPU feature bits
  */
-#define NCAPINTS	18	/* N 32-bit words worth of info */
+#define NCAPINTS	19	/* N 32-bit words worth of info */
 #define NBUGINTS	1	/* N 32-bit bug flags */
 
 /*
@@ -220,6 +220,7 @@
 #define X86_FEATURE_RTM		( 9*32+11) /* Restricted Transactional Memory */
 #define X86_FEATURE_CQM		( 9*32+12) /* Cache QoS Monitoring */
 #define X86_FEATURE_MPX		( 9*32+14) /* Memory Protection Extension */
+#define X86_FEATURE_RDT		( 9*32+15) /* Resource Allocation */
 #define X86_FEATURE_AVX512F	( 9*32+16) /* AVX-512 Foundation */
 #define X86_FEATURE_AVX512DQ	( 9*32+17) /* AVX-512 DQ (Double/Quad granular) Instructions */
 #define X86_FEATURE_RDSEED	( 9*32+18) /* The RDSEED instruction */
@@ -284,8 +285,11 @@
 
 /* AMD-defined CPU features, CPUID level 0x80000007 (ebx), word 17 */
 #define X86_FEATURE_OVERFLOW_RECOV (17*32+0) /* MCA overflow recovery support */
-#define X86_FEATURE_SUCCOR	(17*32+1) /* Uncorrectable error containment and recovery */
-#define X86_FEATURE_SMCA	(17*32+3) /* Scalable MCA */
+#define X86_FEATURE_SUCCOR	(17*32+ 1) /* Uncorrectable error containment and recovery */
+#define X86_FEATURE_SMCA	(17*32+ 3) /* Scalable MCA */
+
+/* Intel-defined CPU features, CPUID level 0x00000010:0 (ebx), word 18 */
+#define X86_FEATURE_CAT_L3      (18*32+ 1) /* Cache Allocation L3 */
 
 /*
  * BUG word(s)
