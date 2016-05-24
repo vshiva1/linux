@@ -13,13 +13,53 @@
 #define MSR_IA32_QM_EVTSEL	0x0c8d
 
 static unsigned int cqm_l3_scale; /* supposedly cacheline size */
+static bool cqm_enabled, mbm_enabled;
 
 #define RMID_VAL_ERROR		(1ULL << 63)
 #define RMID_VAL_UNAVAIL	(1ULL << 62)
+#define MBM_CNTR_WIDTH		24
 
 #define QOS_L3_OCCUP_EVENT_ID	(1 << 0)
+/*
+ * MBM Event IDs as defined in SDM section 17.15.5
+ * Event IDs are used to program EVTSEL MSRs before reading mbm event counters
+ */
+#define QOS_MBM_TOTAL_EVENT_ID	0x02
+#define QOS_MBM_LOCAL_EVENT_ID	0x03
+#define MBM_FIRST_EVT_SHIFT	8
+
+#define QOS_MBM_TB_FIRST			\
+	(1 << (MBM_FIRST_EVT_SHIFT + QOS_MBM_TOTAL_EVENT_ID))
+#define QOS_MBM_LB_FIRST			\
+	(1 << (MBM_FIRST_EVT_SHIFT + QOS_MBM_LOCAL_EVENT_ID))
 
 #define QOS_EVENT_MASK		QOS_L3_OCCUP_EVENT_ID
+
+static inline void update_sample(struct sample *s, u64 val, int first)
+{
+	struct sample *mbm_current = s;
+	u64 shift;
+	u64 bytes;
+
+	if (first) {
+		mbm_current->prev_msr = val;
+		mbm_current->interval_bytes = 0;
+		return;
+	}
+
+	/*
+	 * The h/w guarantees that counters will not overflow
+	 * so long as we poll them at least once per second.
+	 */
+	shift = 64 - MBM_CNTR_WIDTH;
+	bytes = (val << shift) - (mbm_current->prev_msr << shift);
+	bytes >>= shift;
+
+	bytes *= cqm_l3_scale;
+
+	mbm_current->interval_bytes = bytes;
+	mbm_current->prev_msr = val;
+}
 
 /*
  * Update if enough time has passed since last read.
@@ -31,10 +71,14 @@ static unsigned int cqm_l3_scale; /* supposedly cacheline size */
  * Return 1 if value was updated, 0 if not, negative number if error.
  */
 static inline int __cqm_prmid_update(struct prmid *prmid,
+				     unsigned long *ebm,
 				     unsigned long jiffies_min_delta)
 {
 	unsigned long now = jiffies;
 	unsigned long last_read_time;
+	u32 nr_evt = BITS_PER_BYTE;
+	u32 evtid, offset=0;
+	bool first_event;
 	u64 val;
 
 	/*
@@ -47,19 +91,42 @@ static inline int __cqm_prmid_update(struct prmid *prmid,
 			return 0;
 	}
 
-	wrmsr(MSR_IA32_QM_EVTSEL, QOS_L3_OCCUP_EVENT_ID, prmid->rmid);
-	rdmsrl(MSR_IA32_QM_CTR, val);
+	evtid = find_next_bit(ebm, nr_evt, offset);
 
-	/*
-	 * Ignore this reading on error states and do not update the value.
-	 */
-	WARN_ON_ONCE(val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL));
-	if (val & RMID_VAL_ERROR)
-		return -EINVAL;
-	if (val & RMID_VAL_UNAVAIL)
-		return -ENODATA;
+	while (evtid < nr_evt) {
 
-	atomic64_set(&prmid->last_read_value, val);
+		wrmsr(MSR_IA32_QM_EVTSEL, evtid, prmid->rmid);
+		rdmsrl(MSR_IA32_QM_CTR, val);
+
+		/*
+		 * Ignore this reading on error states and do not update the value.
+		 */
+		WARN_ON_ONCE(val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL));
+		if (val & RMID_VAL_ERROR)
+			return -EINVAL;
+		if (val & RMID_VAL_UNAVAIL)
+			return -ENODATA;
+
+		switch(evtid) {
+		case QOS_L3_OCCUP_EVENT_ID:
+			atomic64_set(&prmid->last_read_value, val);
+			break;
+
+		case QOS_MBM_TOTAL_EVENT_ID:
+			first_event =  (*ebm) & QOS_MBM_TB_FIRST;
+			update_sample(&prmid->tb, val, first_event);
+			break;
+
+		case QOS_MBM_LOCAL_EVENT_ID:
+			first_event = (*ebm) & QOS_MBM_LB_FIRST;
+			update_sample(&prmid->lb, val, first_event);
+			break;
+		}
+
+		offset = evtid + 1;
+		evtid = find_next_bit(ebm, nr_evt, offset);
+	}
+
 	/*
 	 * Protect last_read_time from being updated before last_read_value is.
 	 * So reader always receive an updated value even if sometimes values
@@ -72,9 +139,9 @@ static inline int __cqm_prmid_update(struct prmid *prmid,
 	return 1;
 }
 
-static inline int cqm_prmid_update(struct prmid *prmid)
+static inline int cqm_prmid_update(struct prmid *prmid, unsigned long *ebm)
 {
-	return __cqm_prmid_update(prmid, __rmid_min_update_time);
+	return __cqm_prmid_update(prmid, ebm, __rmid_min_update_time);
 }
 
 /*
@@ -874,9 +941,10 @@ static int astack__end(struct astack *astack, struct anode *anode, int idx)
 	       idx > astack->top_idx;
 }
 
-static int __rmid_fn__cqm_prmid_update(struct prmid *prmid, u64 *val)
+static int
+__rmid_fn__cqm_prmid_update(struct prmid *prmid, unsigned long *ebm, u64 *val)
 {
-	int ret = cqm_prmid_update(prmid);
+	int ret = cqm_prmid_update(prmid, ebm);
 
 	if (ret >= 0)
 		*val = atomic64_read(&prmid->last_read_value);
@@ -888,7 +956,8 @@ static int __rmid_fn__cqm_prmid_update(struct prmid *prmid, u64 *val)
  */
 static int astack__rmids_sum_apply(
 	struct astack *astack,
-	u16 pkg_id, int (*fn)(struct prmid *, u64 *), u64 *total)
+	u16 pkg_id, int (*fn)(struct prmid *, unsigned long *, u64 *),
+	u64 *total)
 {
 	struct prmid *prmid;
 	struct anode *anode;
@@ -902,10 +971,10 @@ static int astack__rmids_sum_apply(
 			/* node in tail only has astack->top_idx elements. */
 			if (astack__end(astack, anode, i))
 				break;
-			rmid = anode->rmids[i];
+			rmid = anode->einfo[i].rmid;
 			prmid = cqm_pkgs_data[pkg_id]->prmids_by_rmid[rmid];
 			WARN_ON_ONCE(!prmid);
-			ret = fn(prmid, &count);
+			ret = fn(prmid, &anode->einfo[i].evt_bm, &count);
 			if (ret < 0) {
 				if (!first_error)
 					first_error = ret;
@@ -917,11 +986,156 @@ static int astack__rmids_sum_apply(
 	return first_error;
 }
 
+static struct monr *
+monr_next_child(struct monr *pos, struct monr *parent);
+static inline int
+pmonr__get_read_rmid(struct pmonr *pmonr, u32 *rmid, bool fail_on_inherited);
+
+static struct monr *
+monr_leftmost_descendant(struct monr *pos)
+{
+	struct monr *last;
+
+	do {
+		last = pos;
+		pos = monr_next_child(NULL, pos);
+	} while (pos);
+
+	return last;
+}
+
+static struct monr *
+monr_next_descendant_post(struct monr *pos, struct monr *root)
+{
+	struct monr *next;
+
+	/* if first iteration, visit leftmost descendant which may be @root */
+	if (!pos)
+		return monr_leftmost_descendant(root);
+
+	/* if we visited @root, we're done */
+	if (pos == root)
+		return NULL;
+
+	/* if there's an unvisited sibling, visit its leftmost descendant */
+	next = monr_next_child(pos, pos->parent);
+	if (next)
+		return monr_leftmost_descendant(next);
+
+	/* no sibling left, visit parent */
+	return pos->parent;
+}
+
+/*
+ * timed_update_sample - update the pmonr bytes and monr bytes
+ * @s: points to the pmonr sample.
+ * @ps: the parent pmonr sample.
+ * @m: monr bytes.
+ * @cs: the current prmid sample.
+ */
+static inline void timed_update_sample(struct sample *s, struct sample *ps,
+				  atomic64_t *m, struct sample *cs)
+{
+	s->interval_bytes += cs->interval_bytes;
+	atomic64_add((long long)s->interval_bytes, m);
+
+	if (ps)
+		ps->interval_bytes += s->interval_bytes;
+	s->interval_bytes = 0;
+}
+
+/*
+ * For MBM we need to 'count bytes' unlike 'snapshot bytes' in cqm which
+ * means we need to consider time dimension as well:
+ *
+ * The counting is done as follows:
+ * 1.For each interval, the interval bytes for pmonr are updated from its prmid
+ * 2.the pmonr also updates the interval bytes for its parent.
+ * 3.Once all interval_bytes are computed, thats added to the
+ * total_bytes of monr.
+ * 4.reset the pmonr interval bytes so we count only the current interval bytes
+ * next time.
+ *
+ * This is done bottom up in the tree so that first we update the children
+ * who can update their parents as well which serves 2 purposes:
+ *
+ * 1. This takes care of counting events
+ *   which start counting at different times for the same monr. For ex:
+ *   if we counted already 10MB for a monr and a new perf instance is launched,
+ *   the new event should not count he bytes already counted for this monr.
+ *   We still need to reuse the monr because we can have only one RMID
+ *   associated with any PIDs in the monr hierarchy.
+ * 2. This also takes care of tasks moving between monrs. We count
+ *   the bytes the task stayed with a monr this way.
+ *
+ * By the end of this call on all pkgs monr would have an updated total_bytes.
+ */
+static int timed_update_mbm_count(u16 pkgid)
+{
+	struct pkg_data *pkg_data = cqm_pkgs_data[pkgid];
+	struct sample *psl = NULL,*pst = NULL;
+	struct monr *root = monr_hrchy_root;
+	struct pmonr *pmonr,*ppmonr = NULL;
+	struct monr *pos = NULL;
+	struct prmid *prmid;
+	unsigned long flags;
+	int ret = 0;
+	u32 rmid;
+
+	raw_spin_lock_irqsave_nested(&pkg_data->pkg_data_lock, flags, pkgid);
+	while ((pos = monr_next_descendant_post(pos, root))) {
+
+		pmonr = pos->pmonrs[pkgid];
+
+		/*
+		 * The updates are only done for astate pmonrs which
+		 * are the only ones to have their own rmids.
+		 * The istate pmonrs use rmid from their ancestors
+		 * and we hence count the ancestor's count.
+		 */
+		if (!__pmonr__in_astate(pmonr))
+			continue;
+
+		ret = pmonr__get_read_rmid(pmonr,
+					   &rmid, false);
+		if (ret)
+			goto exit_error;
+
+		if (pos->parent) {
+			ppmonr = pos->parent->pmonrs[pkgid];
+			pst = &ppmonr->tb;
+			psl = &ppmonr->lb;
+		}
+
+		prmid = __prmid_from_rmid(pkgid, rmid);
+
+		if (QOS_MBM_TOTAL_EVENT_ID & pos->evtinfo_bm)
+			timed_update_sample(&pmonr->tb, pst,
+					    &pos->total_bytes, &prmid->tb);
+
+		if (QOS_MBM_LOCAL_EVENT_ID & pos->evtinfo_bm)
+			timed_update_sample(&pmonr->lb, psl,
+					    &pos->local_bytes, &prmid->lb);
+
+		ppmonr = NULL;
+		pst = NULL;
+		psl = NULL;
+	}
+	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+
+	return ret;
+exit_error:
+	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
+
+	return ret;
+}
+
 /* Does not need mutex since protected by locks when transversing
  * astate_pmonrs_lru and updating atomic prmids.
  */
 static int update_rmids_in_astate_pmonrs_lru(u16 pkg_id)
 {
+	struct anode_evt_info evt_info;
 	struct astack astack;
 	struct pkg_data *pkg_data;
 	struct pmonr *pmonr;
@@ -941,9 +1155,13 @@ retry:
 	list_for_each_entry(pmonr,
 			    &pkg_data->astate_pmonrs_lru, rotation_entry) {
 		ret = astack__push(&astack);
+
 		if (ret)
 			break;
-		__astack__top(&astack, rmids) = pmonr->prmid->rmid;
+		evt_info.rmid = pmonr->prmid->rmid;
+		evt_info.evt_bm = pmonr->monr->evtinfo_bm | pmonr->evtfirst_bm;
+		pmonr->evtfirst_bm = 0;
+		__astack__top(&astack, einfo) = evt_info;
 	}
 	raw_spin_unlock_irqrestore(&pkg_data->pkg_data_lock, flags);
 	if (ret) {
@@ -954,6 +1172,9 @@ retry:
 	ret = astack__rmids_sum_apply(&astack, pkg_id,
 				      &__rmid_fn__cqm_prmid_update, &count);
 	astack__release(&astack);
+
+	ret = timed_update_mbm_count(pkg_id);
+
 	return ret;
 }
 
@@ -1781,6 +2002,7 @@ __try_free_ilstate_prmids(struct pkg_data *pkg_data,
 	struct pmonr *pmonr, *tmp_pmonr, *istate_pmonr;
 	struct prmid *prmid;
 	unsigned long flags;
+	unsigned long ebm;
 	u64 val;
 	bool succeed;
 	int ret, nr_activated = 0;
@@ -1817,7 +2039,9 @@ __try_free_ilstate_prmids(struct pkg_data *pkg_data,
 			continue;
 		}
 
+		ebm = QOS_L3_OCCUP_EVENT_ID;
 		ret = __cqm_prmid_update(pmonr->limbo_prmid,
+					  &ebm,
 					  __rmid_min_update_time);
 		if (WARN_ON_ONCE(ret < 0))
 			continue;
@@ -1861,6 +2085,7 @@ __try_free_limbo_prmids(struct pkg_data *pkg_data,
 			unsigned int cqm_threshold,
 			unsigned int *min_occupancy_dirty)
 {
+	unsigned long ebm = QOS_L3_OCCUP_EVENT_ID;
 	struct prmid *prmid, *tmp_prmid;
 	unsigned long flags;
 	bool succeed;
@@ -1879,8 +2104,12 @@ __try_free_limbo_prmids(struct pkg_data *pkg_data,
 
 		/* If min update time is good enough for user, it is good
 		 * enough for rotation.
+		 * ebm is just llc_occupancy, since this rmid has no
+		 * pmonr and we need to just update the llc_occupancy.
 		 */
-		ret = __cqm_prmid_update(prmid, __rmid_min_update_time);
+		ret = __cqm_prmid_update(prmid,
+					  &ebm,
+					  __rmid_min_update_time);
 		if (WARN_ON_ONCE(ret < 0))
 			continue;
 
@@ -2260,6 +2489,93 @@ static void intel_cqm_timed_update_work(struct work_struct *work)
 		__intel_cqm_schedule_timed_update_for_pkg(pkg_id);
 }
 
+static inline bool is_tbyte_event(int e)
+{
+	return (e == QOS_MBM_TOTAL_EVENT_ID);
+}
+
+static inline bool is_lbyte_event(int e)
+{
+	return (e == QOS_MBM_LOCAL_EVENT_ID);
+}
+
+static inline bool is_mbm_event(int e)
+{
+	return (is_tbyte_event(e) || is_lbyte_event(e));
+}
+
+static void mbm_set_first(u32 evtid, struct monr *monr)
+{
+	struct pmonr *pmonr;
+	int i;
+
+	cqm_pkg_id_for_each_online(i) {
+		pmonr = monr->pmonrs[i];
+		pmonr->evtfirst_bm |= (1 << (evtid + MBM_FIRST_EVT_SHIFT));
+	}
+}
+
+/*
+ * cqm_bm_set - set the event info bits.
+ * Set the event bit for first event created
+ * and clear the bit for last event destroyed.
+ */
+static inline bool cqm_bm_set(unsigned long *bm, int cc, int c, unsigned int id)
+{
+	if (cc == 1 && c == 1) {
+		bitmap_set(bm, id, 1);
+		return true;
+	} else if (!cc) {
+		bitmap_clear(bm, id, 1);
+	}
+	return false;
+}
+
+static inline void cqm_evtinfo_setup(struct perf_event *event, int count)
+{
+	struct monr *cmonr = (struct monr *) event->hw.cqm_monr;
+	unsigned long *bm = &cmonr->evtinfo_bm;
+	atomic64_t *monrb;
+	int c;
+
+	switch (event->attr.config) {
+	case QOS_L3_OCCUP_EVENT_ID:
+		cmonr->cqm_evt_count += count;
+		c = cmonr->cqm_evt_count;
+		cqm_bm_set(bm, c, count, QOS_L3_OCCUP_EVENT_ID);
+		break;
+
+	case QOS_MBM_TOTAL_EVENT_ID:
+		cmonr->tbyte_evt_count += count;
+		c = cmonr->tbyte_evt_count;
+		if (cqm_bm_set(bm, c, count, QOS_MBM_TOTAL_EVENT_ID))
+			mbm_set_first(event->attr.config, cmonr);
+
+		/*
+		 * If event is being added store the current bytes in monr.
+		 */
+		if (count > 0) {
+			monrb = &cmonr->total_bytes;
+			event->hw.prev_count = atomic64_read(monrb);
+		}
+
+		break;
+
+	case QOS_MBM_LOCAL_EVENT_ID:
+		cmonr->lbyte_evt_count += count;
+		c = cmonr->lbyte_evt_count;
+		if (cqm_bm_set(bm, c, count, QOS_MBM_TOTAL_EVENT_ID))
+			mbm_set_first(event->attr.config, cmonr);
+
+		if (count > 0) {
+			monrb = &cmonr->local_bytes;
+			event->hw.prev_count = atomic64_read(monrb);
+		}
+
+		break;
+	}
+}
+
 /*
  * Find a group and setup RMID.
  *
@@ -2274,11 +2590,14 @@ intel_cqm_setup_event(struct perf_event *event, struct perf_event **group)
 
 	lockdep_assert_held(&cqm_mutex);
 
+	cqm_evtinfo_setup(event, 1);
+
 	list_for_each_entry(iter, &cache_groups, hw.cqm_event_groups_entry) {
 		monr = monr_from_event(iter);
 		if (__match_event(iter, event)) {
 			/* All tasks in a group share an monr. */
 			event_set_monr(event, monr);
+
 			*group = iter;
 			return 0;
 		}
@@ -2374,10 +2693,12 @@ pmonr__get_read_rmid(struct pmonr *pmonr, u32 *rmid, bool fail_on_inherited)
 static int pmonr__read_subtree(struct monr *monr, u16 pkg_id,
 			       u64 *total, bool fail_on_inh_descendant)
 {
+	struct anode_evt_info evt_info;
 	struct monr *pos = NULL;
 	struct astack astack;
 	int ret;
 	unsigned long flags;
+	unsigned long ebm;
 	u64 count;
 	struct pkg_data *pkg_data = cqm_pkgs_data[pkg_id];
 
@@ -2394,13 +2715,15 @@ static int pmonr__read_subtree(struct monr *monr, u16 pkg_id,
 
 	while ((pos = monr_next_descendant_pre(pos, monr))) {
 		struct prmid *prmid;
+		struct pmonr *pmonr;
 		u32 rmid;
 		/* the pmonr of the monr to read cannot be inherited,
 		 * descendants may, depending on flag.
 		 */
 		bool fail_on_inh = pos == monr || fail_on_inh_descendant;
 
-		ret = pmonr__get_read_rmid(pos->pmonrs[pkg_id],
+		pmonr = pos->pmonrs[pkg_id];
+		ret = pmonr__get_read_rmid(pmonr,
 					   &rmid, fail_on_inh);
 		if (ret)
 			goto exit_error;
@@ -2408,9 +2731,13 @@ static int pmonr__read_subtree(struct monr *monr, u16 pkg_id,
 		if (rmid == INVALID_RMID)
 			continue;
 
+		ebm = pmonr->evtfirst_bm | pos->evtinfo_bm;
+		pmonr->evtfirst_bm = 0;
 		ret = astack__push(&astack);
 		if (!ret) {
-			__astack__top(&astack, rmids) = rmid;
+			evt_info.rmid = rmid;
+			evt_info.evt_bm = ebm;
+			__astack__top(&astack, einfo) = evt_info;
 			continue;
 		}
 		/* If no space in stack, update and read here (slower). */
@@ -2418,7 +2745,7 @@ static int pmonr__read_subtree(struct monr *monr, u16 pkg_id,
 		if (WARN_ON_ONCE(!prmid))
 			goto exit_error;
 
-		ret = cqm_prmid_update(prmid);
+		ret = cqm_prmid_update(prmid, &ebm);
 		if (ret < 0)
 			goto exit_error;
 
@@ -2447,6 +2774,7 @@ static int __read_task_event(struct perf_event *event)
 {
 	int i, ret;
 	u64 count = 0;
+	unsigned long ebm;
 	u16 pkg_id = topology_physical_package_id(smp_processor_id());
 	struct monr *monr = monr_from_event(event);
 
@@ -2467,7 +2795,9 @@ static int __read_task_event(struct perf_event *event)
 
 		/* update and read local for this cpu's package. */
 		if (i == pkg_id) {
-			ret = cqm_prmid_update(prmid);
+			ebm = monr->evtinfo_bm | pmonr->evtfirst_bm;
+			pmonr->evtfirst_bm = 0;
+			ret = cqm_prmid_update(prmid, &ebm);
 			if (ret < 0)
 				return ret;
 		}
@@ -2521,6 +2851,7 @@ static inline void __intel_cqm_event_start(
 	if (!(event->hw.state & PERF_HES_STOPPED))
 		return;
 	event->hw.state &= ~PERF_HES_STOPPED;
+
 	pqr_cache_update_rmid(summary.sched_rmid, PQR_RMID_MODE_EVENT);
 }
 
@@ -2593,6 +2924,9 @@ static void intel_cqm_event_terminate(struct perf_event *event)
 	unsigned long flags;
 
 	mutex_lock(&cqm_mutex);
+
+	cqm_evtinfo_setup(event, -1);
+
 	/*
 	 * If there's another event in this group...
 	 */
@@ -2735,6 +3069,16 @@ EVENT_ATTR_STR(llc_occupancy.unit, intel_cqm_llc_unit, "Bytes");
 EVENT_ATTR_STR(llc_occupancy.scale, intel_cqm_llc_scale, NULL);
 EVENT_ATTR_STR(llc_occupancy.snapshot, intel_cqm_llc_snapshot, "1");
 
+EVENT_ATTR_STR(total_bytes, intel_cqm_total_bytes, "event=0x02");
+EVENT_ATTR_STR(total_bytes.per-pkg, intel_cqm_total_bytes_pkg, "1");
+EVENT_ATTR_STR(total_bytes.unit, intel_cqm_total_bytes_unit, "MB");
+EVENT_ATTR_STR(total_bytes.scale, intel_cqm_total_bytes_scale, "1e-6");
+
+EVENT_ATTR_STR(local_bytes, intel_cqm_local_bytes, "event=0x03");
+EVENT_ATTR_STR(local_bytes.per-pkg, intel_cqm_local_bytes_pkg, "1");
+EVENT_ATTR_STR(local_bytes.unit, intel_cqm_local_bytes_unit, "MB");
+EVENT_ATTR_STR(local_bytes.scale, intel_cqm_local_bytes_scale, "1e-6");
+
 static struct attribute *intel_cqm_events_attr[] = {
 	EVENT_PTR(intel_cqm_llc),
 	EVENT_PTR(intel_cqm_llc_pkg),
@@ -2744,9 +3088,38 @@ static struct attribute *intel_cqm_events_attr[] = {
 	NULL,
 };
 
+static struct attribute *intel_mbm_events_attr[] = {
+	EVENT_PTR(intel_cqm_total_bytes),
+	EVENT_PTR(intel_cqm_local_bytes),
+	EVENT_PTR(intel_cqm_total_bytes_pkg),
+	EVENT_PTR(intel_cqm_local_bytes_pkg),
+	EVENT_PTR(intel_cqm_total_bytes_unit),
+	EVENT_PTR(intel_cqm_local_bytes_unit),
+	EVENT_PTR(intel_cqm_total_bytes_scale),
+	EVENT_PTR(intel_cqm_local_bytes_scale),
+	NULL,
+};
+
+static struct attribute *intel_cmt_mbm_events_attr[] = {
+	EVENT_PTR(intel_cqm_llc),
+	EVENT_PTR(intel_cqm_total_bytes),
+	EVENT_PTR(intel_cqm_local_bytes),
+	EVENT_PTR(intel_cqm_llc_pkg),
+	EVENT_PTR(intel_cqm_total_bytes_pkg),
+	EVENT_PTR(intel_cqm_local_bytes_pkg),
+	EVENT_PTR(intel_cqm_llc_unit),
+	EVENT_PTR(intel_cqm_total_bytes_unit),
+	EVENT_PTR(intel_cqm_local_bytes_unit),
+	EVENT_PTR(intel_cqm_llc_scale),
+	EVENT_PTR(intel_cqm_total_bytes_scale),
+	EVENT_PTR(intel_cqm_local_bytes_scale),
+	EVENT_PTR(intel_cqm_llc_snapshot),
+	NULL,
+};
+
 static struct attribute_group intel_cqm_events_group = {
 	.name = "events",
-	.attrs = intel_cqm_events_attr,
+	.attrs = NULL,
 };
 
 PMU_FORMAT_ATTR(event, "config:0-7");
@@ -3017,6 +3390,16 @@ static const struct x86_cpu_id intel_cqm_match[] = {
 	{}
 };
 
+static const struct x86_cpu_id intel_mbm_local_match[] = {
+	{ .vendor = X86_VENDOR_INTEL, .feature = X86_FEATURE_CQM_MBM_LOCAL },
+	{}
+};
+
+static const struct x86_cpu_id intel_mbm_total_match[] = {
+	{ .vendor = X86_VENDOR_INTEL, .feature = X86_FEATURE_CQM_MBM_TOTAL },
+	{}
+};
+
 #ifdef CONFIG_CGROUP_PERF
 /* Start monitoring for all cgroups in cgroup hierarchy. */
 static int __start_monitoring_all_cgroups(void)
@@ -3055,7 +3438,14 @@ static int __init intel_cqm_init(void)
 	char *str, scale[20];
 	int i, cpu, ret = 0, min_max_rmid = 0;
 
-	if (!x86_match_cpu(intel_cqm_match))
+	if (x86_match_cpu(intel_cqm_match))
+		cqm_enabled = true;
+
+	if (x86_match_cpu(intel_mbm_local_match) &&
+	     x86_match_cpu(intel_mbm_total_match))
+		mbm_enabled = true;
+
+	if (!cqm_enabled && !mbm_enabled)
 		return -ENODEV;
 
 	cqm_l3_scale = boot_cpu_data.x86_cache_occ_scale;
@@ -3131,6 +3521,13 @@ static int __init intel_cqm_init(void)
 
 	__perf_cpu_notifier(intel_cqm_cpu_notifier);
 
+	if (cqm_enabled && mbm_enabled)
+		intel_cqm_events_group.attrs = intel_cmt_mbm_events_attr;
+	else if (!cqm_enabled && mbm_enabled)
+		intel_cqm_events_group.attrs = intel_mbm_events_attr;
+	else if (cqm_enabled && !mbm_enabled)
+		intel_cqm_events_group.attrs = intel_cqm_events_attr;
+
 	/* Use cqm_init_mutex to synchronize with css's online/offline. */
 	mutex_lock(&cqm_init_mutex);
 
@@ -3150,8 +3547,12 @@ static int __init intel_cqm_init(void)
 
 	mutex_unlock(&cqm_init_mutex);
 
-	pr_info("Intel CQM monitoring enabled with at least %u rmids per package.\n",
-		min_max_rmid + 1);
+	if (cqm_enabled)
+		pr_info("Intel CQM enabled with at least %u rmids per package.\n",
+			min_max_rmid + 1);
+	if (mbm_enabled)
+		pr_info("Intel MBM enabled with at least %u rmids per package.\n",
+			min_max_rmid + 1);
 
 	/* Make sure pqr_common_enable_key is enabled after
 	 * cqm_initialized_key.
@@ -3164,7 +3565,7 @@ static int __init intel_cqm_init(void)
 error_init_mutex:
 	mutex_unlock(&cqm_init_mutex);
 error:
-	pr_err("Intel CQM perf registration failed: %d\n", ret);
+	pr_err("Intel CQM/MBM perf registration failed: %d\n", ret);
 	cpu_notifier_register_done();
 
 	return ret;

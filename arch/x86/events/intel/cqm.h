@@ -22,6 +22,11 @@
 #include <asm/pqr_common.h>
 #include <asm/topology.h>
 
+struct sample {
+	u64			interval_bytes;
+	u64			prev_msr;
+};
+
 /*
  * struct prmid: Package RMID. Per-package wrapper for a rmid.
  * @last_read_value:	Least read value.
@@ -36,6 +41,8 @@
 struct prmid {
 	atomic64_t		last_read_value;
 	atomic64_t		last_read_time;
+	struct sample		tb;
+	struct sample		lb;
 	struct list_head	pool_entry;
 	u32			rmid;
 };
@@ -47,7 +54,7 @@ struct prmid {
 #define RMID_DEFAULT_MIN_UPDATE_TIME 20	/* ms */
 static unsigned int __rmid_min_update_time = RMID_DEFAULT_MIN_UPDATE_TIME;
 
-static inline int cqm_prmid_update(struct prmid *prmid);
+static inline int cqm_prmid_update(struct prmid *prmid, unsigned long *ebm);
 
 #define RMID_DEFAULT_TIMED_UPDATE_PERIOD 100 /* ms */
 static unsigned int __rmid_timed_update_period =
@@ -191,6 +198,9 @@ struct pmonr {
 
 	/* If set, pmonr is in (I)state. */
 	struct pmonr				*ancestor_pmonr;
+	unsigned long				evtfirst_bm;
+	struct sample				tb;
+	struct sample				lb;
 
 	union{
 		struct { /* (A)state variables. */
@@ -223,12 +233,17 @@ struct pmonr {
 #define NR_TYPE_PER_NODE(__type) ((SMP_CACHE_BYTES - (int)sizeof(struct list_head)) / \
 	(int)sizeof(__type))
 
-#define NR_RMIDS_PER_NODE NR_TYPE_PER_NODE(u32)
+typedef struct anode_evt_info {
+	u32 rmid;
+	unsigned long evt_bm;
+}anode_etype;
+
+#define NR_RMIDS_PER_NODE NR_TYPE_PER_NODE(anode_etype)
 
 /* struct anode: Node of an array list used to temporarily store RMIDs. */
 struct anode {
 	/* Last valid RMID is RMID_INVALID */
-	u32			rmids[NR_RMIDS_PER_NODE];
+	struct anode_evt_info	einfo[NR_RMIDS_PER_NODE];
 	struct list_head	entry;
 };
 
@@ -336,6 +351,15 @@ struct pkg_data {
  */
 struct monr {
 	u16				flags;
+
+	unsigned long			evtinfo_bm;
+	int				cqm_evt_count;
+	/* mbm specific data */
+	atomic64_t			total_bytes;
+	atomic64_t			local_bytes;
+	int				tbyte_evt_count;
+	int				lbyte_evt_count;
+
 	/* Back reference pointers */
 	struct perf_cgroup		*mon_cgrp;
 	struct perf_event		*mon_event_group;
