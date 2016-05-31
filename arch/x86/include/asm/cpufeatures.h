@@ -12,7 +12,7 @@
 /*
  * Defines x86 CPU feature bits
  */
-#define NCAPINTS	19	/* N 32-bit words worth of info */
+#define NCAPINTS	20	/* N 32-bit words worth of info */
 #define NBUGINTS	1	/* N 32-bit bug flags */
 
 /*
@@ -290,6 +290,9 @@
 
 /* Intel-defined CPU features, CPUID level 0x00000010:0 (ebx), word 18 */
 #define X86_FEATURE_CAT_L3      (18*32+ 1) /* Cache Allocation L3 */
+
+/* Intel-defined CPU QoS Sub-leaf, CPUID level 0x00000010:1 (ecx), word 19 */
+#define X86_FEATURE_CDP_L3	(19*32+ 2) /* Code data prioritization L3 */
 
 /*
  * BUG word(s)
