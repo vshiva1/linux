@@ -77,23 +77,56 @@ unsigned long try_msr_calibrate_tsc(void)
 	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
 		return 0;
 
+	/*
+	 * 100 MHz BCLK Core Architecture -- before SKL.
+	 * De-rate 100Mhz by about 0.25% to account
+	 * for the average effect of spread-spectrum clocking.
+	 */
+	switch (boot_cpu_data.x86_model) {
+
+	case 0x2A:	/* SNB */
+	case 0x3A:	/* IVB */
+		freq = 99773;
+		goto get_ratio;
+	case 0x2D:	/* SNB Xeon */
+	case 0x3E:	/* IVB Xeon */
+		freq = 99760;
+		goto get_ratio;
+	case 0x3C:	/* HSW */
+	case 0x3F:	/* HSW */
+	case 0x45:	/* HSW */
+	case 0x46:	/* HSW */
+	case 0x3D:	/* BDW */
+	case 0x47:	/* BDW */
+	case 0x4F:	/* BDX */
+	case 0x56:	/* BDX-DE */
+		freq = 99769;
+		goto get_ratio;
+	}
+
+	/*
+	 * Atom Architecture
+	 */
 	cpu_index = match_cpu(boot_cpu_data.x86, boot_cpu_data.x86_model);
 	if (cpu_index < 0)
 		return 0;
-
-	if (freq_desc_tables[cpu_index].msr_plat) {
-		rdmsr(MSR_PLATFORM_INFO, lo, hi);
-		ratio = (lo >> 8) & 0xff;
-	} else {
-		rdmsr(MSR_IA32_PERF_STATUS, lo, hi);
-		ratio = (hi >> 8) & 0x1f;
-	}
 
 	/* Get FSB FREQ ID */
 	rdmsr(MSR_FSB_FREQ, lo, hi);
 	freq_id = lo & 0x7;
 	freq = id_to_freq(cpu_index, freq_id);
 
+	if (!freq_desc_tables[cpu_index].msr_plat) {
+		rdmsr(MSR_IA32_PERF_STATUS, lo, hi);
+		ratio = (hi >> 8) & 0x1f;
+		goto done;
+	}
+
+get_ratio:
+	rdmsr(MSR_PLATFORM_INFO, lo, hi);
+	ratio = (lo >> 8) & 0xff;
+
+done:
 	/* TSC frequency = maximum resolved freq * maximum resolved bus ratio */
 	res = freq * ratio;
 
