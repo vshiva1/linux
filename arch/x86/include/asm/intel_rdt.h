@@ -77,6 +77,7 @@ extern inline void closid_get(u32 closid, int domain);
 extern void closid_put(u32 closid, int domain);
 extern void closid_free(u32 closid, int domain, int level);
 extern int closid_alloc(u32 *closid, int domain);
+extern struct mutex rdtgroup_mutex;
 extern bool cat_l3_enabled;
 extern unsigned int get_domain_num(int level);
 extern struct shared_domain *shared_domain;
