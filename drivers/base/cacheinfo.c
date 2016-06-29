@@ -29,7 +29,7 @@
 #include <linux/sysfs.h>
 
 /* pointer to per cpu cacheinfo */
-static DEFINE_PER_CPU(struct cpu_cacheinfo, ci_cpu_cacheinfo);
+DEFINE_PER_CPU(struct cpu_cacheinfo, ci_cpu_cacheinfo);
 #define ci_cacheinfo(cpu)	(&per_cpu(ci_cpu_cacheinfo, cpu))
 #define cache_leaves(cpu)	(ci_cacheinfo(cpu)->num_leaves)
 #define per_cpu_cacheinfo(cpu)	(ci_cacheinfo(cpu)->info_list)

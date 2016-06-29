@@ -94,6 +94,8 @@ int func(unsigned int cpu)					\
 	return ret;						\
 }
 
+#define ci_cacheinfo(cpu)       (&per_cpu(ci_cpu_cacheinfo, cpu))
+
 struct cpu_cacheinfo *get_cpu_cacheinfo(unsigned int cpu);
 int init_cache_level(unsigned int cpu);
 int populate_cache_leaves(unsigned int cpu);
