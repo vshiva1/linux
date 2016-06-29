@@ -812,3 +812,25 @@ static int __init intel_rdt_late_init(void)
 }
 
 late_initcall(intel_rdt_late_init);
+
+void rdtgroup_fork(struct task_struct *child)
+{
+	INIT_LIST_HEAD(&child->rg_list);
+	child->rdtgroup = NULL;
+}
+
+void rdtgroup_post_fork(struct task_struct *child)
+{
+	if (!use_rdtgroup_tasks)
+		return;
+
+	spin_lock_irq(&rdtgroup_task_lock);
+	if (list_empty(&child->rg_list)) {
+		struct rdtgroup *rdtgrp = current->rdtgroup;
+
+		list_add_tail(&child->rg_list, &rdtgrp->pset.tasks);
+		child->rdtgroup = rdtgrp;
+		atomic_inc(&rdtgrp->pset.refcount);
+	}
+	spin_unlock_irq(&rdtgroup_task_lock);
+}

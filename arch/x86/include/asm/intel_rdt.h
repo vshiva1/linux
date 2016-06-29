@@ -22,6 +22,7 @@ enum resource_type {
 DECLARE_PER_CPU_READ_MOSTLY(int, cpu_l3_domain);
 DECLARE_PER_CPU_READ_MOSTLY(struct rdtgroup *, cpu_rdtgroup);
 
+extern spinlock_t rdtgroup_task_lock;
 extern struct static_key rdt_enable_key;
 void __intel_rdt_sched_in(void *dummy);
 extern bool use_rdtgroup_tasks;

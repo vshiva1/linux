@@ -59,6 +59,7 @@
 #include <asm/unistd.h>
 #include <asm/pgtable.h>
 #include <asm/mmu_context.h>
+#include <asm/intel_rdt.h>
 
 static void __unhash_process(struct task_struct *p, bool group_dead)
 {
@@ -837,6 +838,7 @@ void do_exit(long code)
 	perf_event_exit_task(tsk);
 
 	cgroup_exit(tsk);
+	rdtgroup_exit(tsk);
 
 	/*
 	 * FIXME: do that only when needed, using sched_exit tracepoint
