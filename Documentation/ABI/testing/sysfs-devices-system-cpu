@@ -272,6 +272,23 @@ Description:	Parameters for the CPU cache attributes
 				     the modified cache line is written to main
 				     memory only when it is replaced
 
+
+What:		/sys/devices/system/cpu/cpu*/cache/index*/id
+Date:		July 2016
+Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
+Description:	Cache id
+
+		The id identifies a hardware cache of the system within a given
+		cache index in a set of cache indices. The "index" name is
+		simply a nomenclature from CPUID's leaf 4 which enumerates all
+		caches on the system by referring to each one as a cache index.
+		The (cache index, cache id) pair is unique for the whole
+		system.
+
+		Currently id is implemented on x86. On other platforms, id is
+		not enabled yet.
+
+
 What:		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats
 		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats/turbo_stat
 		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats/sub_turbo_stat
