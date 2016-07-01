@@ -13,6 +13,7 @@
 #include "util/util.h"
 #include <subcmd/parse-options.h>
 #include "util/parse-events.h"
+#include "util/config.h"
 
 #include "util/callchain.h"
 #include "util/cgroup.h"
@@ -131,9 +132,9 @@ rb_find_range(struct perf_evlist *evlist,
 	return backward_rb_find_range(data, mask, head, start, end);
 }
 
-static int record__mmap_read(struct record *rec, int idx)
+static int record__mmap_read(struct record *rec, struct perf_evlist *evlist, int idx)
 {
-	struct perf_mmap *md = &rec->evlist->mmap[idx];
+	struct perf_mmap *md = &evlist->mmap[idx];
 	u64 head = perf_mmap__read_head(md);
 	u64 old = md->prev;
 	u64 end = head, start = old;
@@ -142,7 +143,7 @@ static int record__mmap_read(struct record *rec, int idx)
 	void *buf;
 	int rc = 0;
 
-	if (rb_find_range(rec->evlist, data, md->mask, head,
+	if (rb_find_range(evlist, data, md->mask, head,
 			  old, &start, &end))
 		return -1;
 
@@ -156,7 +157,7 @@ static int record__mmap_read(struct record *rec, int idx)
 		WARN_ONCE(1, "failed to keep up with mmap data. (warn only once)\n");
 
 		md->prev = head;
-		perf_evlist__mmap_consume(rec->evlist, idx);
+		perf_evlist__mmap_consume(evlist, idx);
 		return 0;
 	}
 
@@ -181,7 +182,7 @@ static int record__mmap_read(struct record *rec, int idx)
 	}
 
 	md->prev = head;
-	perf_evlist__mmap_consume(rec->evlist, idx);
+	perf_evlist__mmap_consume(evlist, idx);
 out:
 	return rc;
 }
@@ -341,6 +342,40 @@ int auxtrace_record__snapshot_start(struct auxtrace_record *itr __maybe_unused)
 
 #endif
 
+static int record__mmap_evlist(struct record *rec,
+			       struct perf_evlist *evlist)
+{
+	struct record_opts *opts = &rec->opts;
+	char msg[512];
+
+	if (perf_evlist__mmap_ex(evlist, opts->mmap_pages, false,
+				 opts->auxtrace_mmap_pages,
+				 opts->auxtrace_snapshot_mode) < 0) {
+		if (errno == EPERM) {
+			pr_err("Permission error mapping pages.\n"
+			       "Consider increasing "
+			       "/proc/sys/kernel/perf_event_mlock_kb,\n"
+			       "or try again with a smaller value of -m/--mmap_pages.\n"
+			       "(current value: %u,%u)\n",
+			       opts->mmap_pages, opts->auxtrace_mmap_pages);
+			return -errno;
+		} else {
+			pr_err("failed to mmap with %d (%s)\n", errno,
+				strerror_r(errno, msg, sizeof(msg)));
+			if (errno)
+				return -errno;
+			else
+				return -EINVAL;
+		}
+	}
+	return 0;
+}
+
+static int record__mmap(struct record *rec)
+{
+	return record__mmap_evlist(rec, rec->evlist);
+}
+
 static int record__open(struct record *rec)
 {
 	char msg[512];
@@ -352,7 +387,7 @@ static int record__open(struct record *rec)
 
 	perf_evlist__config(evlist, opts, &callchain_param);
 
-	evlist__for_each(evlist, pos) {
+	evlist__for_each_entry(evlist, pos) {
 try_again:
 		if (perf_evsel__open(pos, pos->cpus, pos->threads) < 0) {
 			if (perf_evsel__fallback(pos, errno, msg, sizeof(msg))) {
@@ -377,27 +412,9 @@ try_again:
 		goto out;
 	}
 
-	if (perf_evlist__mmap_ex(evlist, opts->mmap_pages, false,
-				 opts->auxtrace_mmap_pages,
-				 opts->auxtrace_snapshot_mode) < 0) {
-		if (errno == EPERM) {
-			pr_err("Permission error mapping pages.\n"
-			       "Consider increasing "
-			       "/proc/sys/kernel/perf_event_mlock_kb,\n"
-			       "or try again with a smaller value of -m/--mmap_pages.\n"
-			       "(current value: %u,%u)\n",
-			       opts->mmap_pages, opts->auxtrace_mmap_pages);
-			rc = -errno;
-		} else {
-			pr_err("failed to mmap with %d (%s)\n", errno,
-				strerror_r(errno, msg, sizeof(msg)));
-			if (errno)
-				rc = -errno;
-			else
-				rc = -EINVAL;
-		}
+	rc = record__mmap(rec);
+	if (rc)
 		goto out;
-	}
 
 	session->evlist = evlist;
 	perf_session__set_id_hdr_size(session);
@@ -481,17 +498,20 @@ static struct perf_event_header finished_round_event = {
 	.type = PERF_RECORD_FINISHED_ROUND,
 };
 
-static int record__mmap_read_all(struct record *rec)
+static int record__mmap_read_evlist(struct record *rec, struct perf_evlist *evlist)
 {
 	u64 bytes_written = rec->bytes_written;
 	int i;
 	int rc = 0;
 
-	for (i = 0; i < rec->evlist->nr_mmaps; i++) {
-		struct auxtrace_mmap *mm = &rec->evlist->mmap[i].auxtrace_mmap;
+	if (!evlist)
+		return 0;
 
-		if (rec->evlist->mmap[i].base) {
-			if (record__mmap_read(rec, i) != 0) {
+	for (i = 0; i < evlist->nr_mmaps; i++) {
+		struct auxtrace_mmap *mm = &evlist->mmap[i].auxtrace_mmap;
+
+		if (evlist->mmap[i].base) {
+			if (record__mmap_read(rec, evlist, i) != 0) {
 				rc = -1;
 				goto out;
 			}
@@ -513,6 +533,17 @@ static int record__mmap_read_all(struct record *rec)
 
 out:
 	return rc;
+}
+
+static int record__mmap_read_all(struct record *rec)
+{
+	int err;
+
+	err = record__mmap_read_evlist(rec, rec->evlist);
+	if (err)
+		return err;
+
+	return err;
 }
 
 static void record__init_features(struct record *rec)
@@ -655,6 +686,24 @@ perf_event__synth_time_conv(const struct perf_event_mmap_page *pc __maybe_unused
 	return 0;
 }
 
+static const struct perf_event_mmap_page *
+perf_evlist__pick_pc(struct perf_evlist *evlist)
+{
+	if (evlist && evlist->mmap && evlist->mmap[0].base)
+		return evlist->mmap[0].base;
+	return NULL;
+}
+
+static const struct perf_event_mmap_page *record__pick_pc(struct record *rec)
+{
+	const struct perf_event_mmap_page *pc;
+
+	pc = perf_evlist__pick_pc(rec->evlist);
+	if (pc)
+		return pc;
+	return NULL;
+}
+
 static int record__synthesize(struct record *rec)
 {
 	struct perf_session *session = rec->session;
@@ -692,7 +741,7 @@ static int record__synthesize(struct record *rec)
 		}
 	}
 
-	err = perf_event__synth_time_conv(rec->evlist->mmap[0].base, tool,
+	err = perf_event__synth_time_conv(record__pick_pc(rec), tool,
 					  process_synthesized_event, machine);
 	if (err)
 		goto out;
@@ -1267,6 +1316,8 @@ static struct record record = {
 const char record_callchain_help[] = CALLCHAIN_RECORD_HELP
 	"\n\t\t\t\tDefault: fp";
 
+static bool dry_run;
+
 /*
  * XXX Will stay a global variable till we fix builtin-script.c to stop messing
  * with it and switch to use the library functions in perf_evlist that came
@@ -1386,6 +1437,8 @@ struct option __record_options[] = {
 		    "append timestamp to output filename"),
 	OPT_BOOLEAN(0, "switch-output", &record.switch_output,
 		    "Switch output when receive SIGUSR2"),
+	OPT_BOOLEAN(0, "dry-run", &dry_run,
+		    "Parse options then exit"),
 	OPT_END()
 };
 
@@ -1454,6 +1507,9 @@ int cmd_record(int argc, const char **argv, const char *prefix __maybe_unused)
 					      rec->opts.auxtrace_snapshot_opts);
 	if (err)
 		return err;
+
+	if (dry_run)
+		return 0;
 
 	err = bpf__setup_stdout(rec->evlist);
 	if (err) {

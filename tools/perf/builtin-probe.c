@@ -389,7 +389,7 @@ static int perf_del_probe_events(struct strfilter *filter)
 
 	ret = probe_file__get_events(kfd, filter, klist);
 	if (ret == 0) {
-		strlist__for_each(ent, klist)
+		strlist__for_each_entry(ent, klist)
 			pr_info("Removed event: %s\n", ent->s);
 
 		ret = probe_file__del_strlist(kfd, klist);
@@ -399,7 +399,7 @@ static int perf_del_probe_events(struct strfilter *filter)
 
 	ret2 = probe_file__get_events(ufd, filter, ulist);
 	if (ret2 == 0) {
-		strlist__for_each(ent, ulist)
+		strlist__for_each_entry(ent, ulist)
 			pr_info("Removed event: %s\n", ent->s);
 
 		ret2 = probe_file__del_strlist(ufd, ulist);
@@ -512,6 +512,7 @@ __cmd_probe(int argc, const char **argv, const char *prefix __maybe_unused)
 		    "Enable symbol demangling"),
 	OPT_BOOLEAN(0, "demangle-kernel", &symbol_conf.demangle_kernel,
 		    "Enable kernel symbol demangling"),
+	OPT_BOOLEAN(0, "cache", &probe_conf.cache, "Manipulate probe cache"),
 	OPT_END()
 	};
 	int ret;
