@@ -238,6 +238,179 @@ static int get_shared_domain(int domain, int level)
 
 	return -1;
 }
+static void rdt_info_show_cat(struct seq_file *seq, int level)
+{
+	int domain;
+	int domain_num = get_domain_num(level);
+	int closid;
+	u64 cbm;
+	struct clos_cbm_table **cctable;
+	int maxid;
+	int shared_domain;
+	int cnt;
+
+	if (level == CACHE_LEVEL3)
+		cctable = l3_cctable;
+	else
+		return;
+
+	maxid = cconfig.max_closid;
+	for (domain = 0; domain < domain_num; domain++) {
+		seq_printf(seq, "domain %d:\n", domain);
+		shared_domain = get_shared_domain(domain, level);
+		for (closid = 0; closid < maxid; closid++) {
+			int dindex, iindex;
+
+			if (test_bit(closid,
+			(unsigned long *)cconfig.closmap[shared_domain])) {
+				dindex = get_dcbm_table_index(closid);
+				cbm = cctable[domain][dindex].cbm;
+				cnt = cctable[domain][dindex].clos_refcnt;
+				seq_printf(seq, "cbm[%d]=%lx, refcnt=%d\n",
+					 dindex, (unsigned long)cbm, cnt);
+				if (cdp_enabled) {
+					iindex = get_icbm_table_index(closid);
+					cbm = cctable[domain][iindex].cbm;
+					cnt =
+					   cctable[domain][iindex].clos_refcnt;
+					seq_printf(seq,
+						   "cbm[%d]=%lx, refcnt=%d\n",
+						   iindex, (unsigned long)cbm,
+						   cnt);
+				}
+			} else {
+				cbm = max_cbm(level);
+				cnt = 0;
+				dindex = get_dcbm_table_index(closid);
+				seq_printf(seq, "cbm[%d]=%lx, refcnt=%d\n",
+					 dindex, (unsigned long)cbm, cnt);
+				if (cdp_enabled) {
+					iindex = get_icbm_table_index(closid);
+					seq_printf(seq,
+						 "cbm[%d]=%lx, refcnt=%d\n",
+						 iindex, (unsigned long)cbm,
+						 cnt);
+				}
+			}
+		}
+	}
+}
+
+static void show_shared_domain(struct seq_file *seq)
+{
+	int domain;
+
+	seq_puts(seq, "Shared domains:\n");
+
+	for_each_cache_domain(domain, 0, shared_domain_num) {
+		struct shared_domain *sd;
+
+		sd = &shared_domain[domain];
+		seq_printf(seq, "domain[%d]:", domain);
+		if (cat_enabled(CACHE_LEVEL3))
+			seq_printf(seq, "l3_domain=%d ", sd->l3_domain);
+		seq_printf(seq, "cpumask=%*pb\n",
+			   cpumask_pr_args(&sd->cpumask));
+	}
+}
+
+static int rdt_info_show(struct seq_file *seq, void *v)
+{
+	show_shared_domain(seq);
+
+	if (cat_l3_enabled) {
+		if (rdt_opts.verbose)
+			rdt_info_show_cat(seq, CACHE_LEVEL3);
+	}
+
+	seq_puts(seq, "\n");
+
+	return 0;
+}
+
+static int res_type_to_level(enum resource_type res_type, int *level)
+{
+	int ret = 0;
+
+	switch (res_type) {
+	case RESOURCE_L3:
+		*level = CACHE_LEVEL3;
+		break;
+	case RESOURCE_NUM:
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
+static int domain_to_cache_id_show(struct seq_file *seq, void *v)
+{
+	struct kernfs_open_file *of = seq->private;
+	enum resource_type res_type;
+	int domain;
+	int leaf;
+	int level = 0;
+	int ret;
+
+	res_type = (enum resource_type)of->kn->parent->priv;
+
+	ret = res_type_to_level(res_type, &level);
+	if (ret)
+		return 0;
+
+	leaf =	get_cache_leaf(level, 0);
+
+	for (domain = 0; domain < get_domain_num(level); domain++) {
+		unsigned int cid;
+
+		cid = cache_domains[leaf].shared_cache_id[domain];
+		seq_printf(seq, "%d:%d\n", domain, cid);
+	}
+
+	return 0;
+}
+
+static struct rftype info_files[] = {
+	{
+		.name = "info",
+		.seq_show = rdt_info_show,
+	},
+	{ }	/* terminate */
+};
+
+/* rdtgroup information files for one cache resource. */
+static struct rftype res_info_files[] = {
+	{
+		.name = "max_closid",
+		.seq_show = rdt_max_closid_show,
+	},
+	{
+		.name = "max_cbm_len",
+		.seq_show = rdt_max_cbm_len_show,
+	},
+	{
+		.name = "domain_to_cache_id",
+		.seq_show = domain_to_cache_id_show,
+	},
+	{ }	/* terminate */
+};
+
+static int info_populate_dir(struct kernfs_node *kn)
+{
+	struct rftype *rfts;
+
+	rfts = info_files;
+	return rdtgroup_addrm_files(kn, rfts, true);
+}
+
+static int res_info_populate_dir(struct kernfs_node *kn)
+{
+	struct rftype *rfts;
+
+	rfts = res_info_files;
+	return rdtgroup_addrm_files(kn, rfts, true);
+}
 
 static int rdtgroup_populate_dir(struct kernfs_node *kn)
 {
@@ -377,6 +550,90 @@ static char *res_info_dir_name(enum resource_type res_type, char *name)
 	return name;
 }
 
+static int create_res_info(enum resource_type res_type,
+			   struct kernfs_node *parent_kn)
+{
+	struct kernfs_node *kn;
+	char name[RDTGROUP_FILE_NAME_MAX];
+	int ret;
+
+	res_info_dir_name(res_type, name);
+	kn = kernfs_create_dir(parent_kn, name, parent_kn->mode, NULL);
+	if (IS_ERR(kn)) {
+		ret = PTR_ERR(kn);
+		goto out;
+	}
+
+	/*
+	 * This extra ref will be put in kernfs_remove() and guarantees
+	 * that @rdtgrp->kn is always accessible.
+	 */
+	kernfs_get(kn);
+
+	ret = rdtgroup_kn_set_ugid(kn);
+	if (ret)
+		goto out_destroy;
+
+	ret = res_info_populate_dir(kn);
+	if (ret)
+		goto out_destroy;
+
+	kernfs_activate(kn);
+
+	ret = 0;
+	goto out;
+
+out_destroy:
+	kernfs_remove(kn);
+out:
+	return ret;
+
+}
+
+static int rdtgroup_create_info_dir(struct kernfs_node *parent_kn,
+				    const char *name)
+{
+	struct kernfs_node *kn;
+	int ret;
+
+	if (parent_kn != root_rdtgrp->kn)
+		return -EPERM;
+
+	/* create the directory */
+	kn = kernfs_create_dir(parent_kn, "info", parent_kn->mode, root_rdtgrp);
+	if (IS_ERR(kn)) {
+		ret = PTR_ERR(kn);
+		goto out;
+	}
+
+	ret = info_populate_dir(kn);
+	if (ret)
+		goto out_destroy;
+
+	if (cat_enabled(CACHE_LEVEL3))
+		create_res_info(RESOURCE_L3, kn);
+
+	/*
+	 * This extra ref will be put in kernfs_remove() and guarantees
+	 * that @rdtgrp->kn is always accessible.
+	 */
+	kernfs_get(kn);
+
+	ret = rdtgroup_kn_set_ugid(kn);
+	if (ret)
+		goto out_destroy;
+
+	kernfs_activate(kn);
+
+	ret = 0;
+	goto out;
+
+out_destroy:
+	kernfs_remove(kn);
+out:
+	return ret;
+}
+
 static int rdtgroup_setup_root(struct rdtgroup_root *root,
 			       unsigned long ss_mask)
 {
@@ -410,6 +667,8 @@ static int rdtgroup_setup_root(struct rdtgroup_root *root,
 	ret = rdtgroup_populate_dir(root->kf_root->kn);
 	if (ret)
 		goto destroy_root;
+
+	rdtgroup_create_info_dir(root->kf_root->kn, "info_dir");
 
 	/*
 	 * Link the root rdtgroup in this hierarchy into all the css_set
