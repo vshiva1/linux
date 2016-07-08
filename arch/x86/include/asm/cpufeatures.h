@@ -220,7 +220,7 @@
 #define X86_FEATURE_RTM		( 9*32+11) /* Restricted Transactional Memory */
 #define X86_FEATURE_CQM		( 9*32+12) /* Cache QoS Monitoring */
 #define X86_FEATURE_MPX		( 9*32+14) /* Memory Protection Extension */
-#define X86_FEATURE_RDT		( 9*32+15) /* Resource Allocation */
+#define X86_FEATURE_RDT		( 9*32+15) /* Resource Director Technology */
 #define X86_FEATURE_AVX512F	( 9*32+16) /* AVX-512 Foundation */
 #define X86_FEATURE_AVX512DQ	( 9*32+17) /* AVX-512 DQ (Double/Quad granular) Instructions */
 #define X86_FEATURE_RDSEED	( 9*32+18) /* The RDSEED instruction */
@@ -289,10 +289,10 @@
 #define X86_FEATURE_SMCA	(17*32+ 3) /* Scalable MCA */
 
 /* Intel-defined CPU features, CPUID level 0x00000010:0 (ebx), word 18 */
-#define X86_FEATURE_CAT_L3      (18*32+ 1) /* Cache Allocation L3 */
+#define X86_FEATURE_CAT_L3	(18*32+ 1) /* Cache Allocation L3 */
 
 /* Intel-defined CPU QoS Sub-leaf, CPUID level 0x00000010:1 (ecx), word 19 */
-#define X86_FEATURE_CDP_L3	(19*32+ 2) /* Code data prioritization L3 */
+#define X86_FEATURE_CDP_L3	(19*32+ 2) /* Code Data Prioritization L3 */
 
 /*
  * BUG word(s)
