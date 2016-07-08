@@ -76,8 +76,6 @@ static DEFINE_SPINLOCK(rdtgroup_idr_lock);
 
 struct percpu_rw_semaphore rdtgroup_threadgroup_rwsem;
 
-#define MAX_CPUMASK_CHAR_IN_HEX	(NR_CPUS/4)
-
 static struct rftype rdtgroup_root_base_files[];
 
 #define RDTGROUP_FILE_NAME_MAX		(MAX_RDTGROUP_TYPE_NAMELEN +	\
@@ -714,7 +712,6 @@ static __init void init_cache_domains(void)
 	struct cpu_cacheinfo *this_cpu_ci;
 	struct cacheinfo *this_leaf;
 	int leaves;
-	char buf[MAX_CPUMASK_CHAR_IN_HEX + 1];
 	unsigned int level;
 
 	for (leaves = 0; leaves < cache_leaves(0); leaves++) {
@@ -725,7 +722,6 @@ static __init void init_cache_domains(void)
 			this_leaf = this_cpu_ci->info_list + leaves;
 			cache_domains[leaves].level = this_leaf->level;
 			mask = &this_leaf->shared_cpu_map;
-			cpumap_print_to_pagebuf(false, buf, mask);
 			for (domain = 0; domain < MAX_CACHE_DOMAINS; domain++) {
 				if (cpumask_test_cpu(cpu,
 				&cache_domains[leaves].shared_cpu_map[domain]))
@@ -753,7 +749,6 @@ DEFINE_SPINLOCK(rdtgroup_task_lock);
 
 void rdtgroup_exit(struct task_struct *tsk)
 {
-
 	spin_lock_irq(&rdtgroup_task_lock);
 	if (!list_empty(&tsk->rg_list)) {
 		struct rdtgroup *rdtgrp = tsk->rdtgroup;
@@ -822,6 +817,29 @@ end:
 	return nbytes;
 }
 
+static void show_rdt_tasks(struct list_head *tasks, struct seq_file *s)
+{
+	struct list_head *pos;
+
+	list_for_each(pos, tasks) {
+		struct task_struct *tsk;
+
+		tsk = list_entry(pos, struct task_struct, rg_list);
+		seq_printf(s, "%d\n", tsk->pid);
+	}
+}
+
+static int rdtgroup_pidlist_show(struct seq_file *s, void *v)
+{
+	struct kernfs_open_file *of = s->private;
+	struct rdtgroup *rdtgrp;
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	show_rdt_tasks(&rdtgrp->pset.tasks, s);
+	rdtgroup_kn_unlock(of->kn);
+	return 0;
+}
+
 static struct rftype rdtgroup_partition_base_files[] = {
 	{
 		.name = "tasks",
@@ -860,6 +878,114 @@ static struct rftype rdtgroup_root_base_files[] = {
 	},
 	{ }	/* terminate */
 };
+
+/*
+ * Insert task into rdtgrp's tasks with pid in order.
+ */
+static int add_task_in_order(struct task_struct *tsk, struct rdtgroup *rdtgrp)
+{
+	struct list_head *l;
+	struct list_head *start_task = &rdtgrp->pset.tasks;
+
+	if (list_empty(start_task)) {
+		list_add_tail(&tsk->rg_list, start_task);
+		return 0;
+	}
+
+	for (l = start_task->next; l != start_task; l = l->next) {
+		struct task_struct *t;
+
+		t = list_entry(l, struct task_struct, rg_list);
+		WARN_ON(t->pid == tsk->pid);
+		if (t->pid > tsk->pid)
+			break;
+	}
+
+	list_add_tail(&tsk->rg_list, l);
+
+	return 0;
+}
+
+int _rdtgroup_move_task(struct task_struct *tsk, struct rdtgroup *rdtgrp)
+{
+	spin_lock_irq(&rdtgroup_task_lock);
+	list_del_init(&tsk->rg_list);
+
+	add_task_in_order(tsk, rdtgrp);
+
+	tsk->rdtgroup = rdtgrp;
+	spin_unlock_irq(&rdtgroup_task_lock);
+	return 0;
+}
+
+static int rdtgroup_move_task(pid_t pid, struct rdtgroup *rdtgrp,
+			      bool threadgroup, struct kernfs_open_file *of)
+{
+	struct task_struct *tsk;
+	int ret;
+
+	percpu_down_write(&rdtgroup_threadgroup_rwsem);
+	rcu_read_lock();
+	if (pid) {
+		tsk = find_task_by_vpid(pid);
+		if (!tsk) {
+			ret = -ESRCH;
+			goto out_unlock_rcu;
+		}
+	} else {
+		tsk = current;
+	}
+
+	if (threadgroup)
+		tsk = tsk->group_leader;
+
+	get_task_struct(tsk);
+	rcu_read_unlock();
+
+	ret = rdtgroup_procs_write_permission(tsk, of);
+	if (!ret)
+		_rdtgroup_move_task(tsk, rdtgrp);
+
+	put_task_struct(tsk);
+	goto out_unlock_threadgroup;
+
+out_unlock_rcu:
+	rcu_read_unlock();
+out_unlock_threadgroup:
+	percpu_up_write(&rdtgroup_threadgroup_rwsem);
+	return ret;
+}
+
+ssize_t _rdtgroup_procs_write(struct rdtgroup *rdtgrp,
+			   struct kernfs_open_file *of, char *buf,
+			   size_t nbytes, loff_t off, bool threadgroup)
+{
+	pid_t pid;
+	int ret;
+
+	if (kstrtoint(strstrip(buf), 0, &pid) || pid < 0)
+		return -EINVAL;
+
+	ret = rdtgroup_move_task(pid, rdtgrp, threadgroup, of);
+
+	return ret ?: nbytes;
+}
+
+static ssize_t rdtgroup_tasks_write(struct kernfs_open_file *of,
+				  char *buf, size_t nbytes, loff_t off)
+{
+	struct rdtgroup *rdtgrp;
+	int ret;
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	if (!rdtgrp)
+		return -ENODEV;
+
+	ret = _rdtgroup_procs_write(rdtgrp, of, buf, nbytes, off, false);
+
+	rdtgroup_kn_unlock(of->kn);
+	return ret;
+}
 
 static void *rdtgroup_idr_replace(struct idr *idr, void *ptr, int id)
 {
@@ -1180,7 +1306,7 @@ static void setup_task_rg_lists(struct rdtgroup *rdtgrp, bool enable)
 		spin_lock_irq(&p->sighand->siglock);
 		if (!(p->flags & PF_EXITING)) {
 			if (enable) {
-				list_add_tail(&p->rg_list, &rdtgrp->pset.tasks);
+				add_task_in_order(p, rdtgrp);
 				p->rdtgroup = rdtgrp;
 				atomic_inc(&rdtgrp->pset.refcount);
 			} else {
