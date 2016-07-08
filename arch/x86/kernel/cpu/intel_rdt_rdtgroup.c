@@ -767,6 +767,60 @@ void rdtgroup_exit(struct task_struct *tsk)
 
 static struct rdtgroup *rdtgroup_kn_lock_live(struct kernfs_node *kn);
 static void rdtgroup_kn_unlock(struct kernfs_node *kn);
+static int rdtgroup_cpus_show(struct seq_file *s, void *v)
+{
+	struct kernfs_open_file *of = s->private;
+	struct rdtgroup *rdtgrp;
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	seq_printf(s, "%*pb\n", cpumask_pr_args(&rdtgrp->cpu_mask));
+	rdtgroup_kn_unlock(of->kn);
+
+	return 0;
+}
+
+static ssize_t rdtgroup_cpus_write(struct kernfs_open_file *of,
+			char *buf, size_t nbytes, loff_t off)
+{
+	struct rdtgroup *rdtgrp;
+	unsigned long bitmap[BITS_TO_LONGS(NR_CPUS)];
+	struct cpumask *cpumask;
+	int cpu;
+	struct list_head *l;
+	struct rdtgroup *r;
+
+	if (!buf)
+		return -EINVAL;
+
+	rdtgrp = rdtgroup_kn_lock_live(of->kn);
+	if (!rdtgrp)
+		return -ENODEV;
+
+	if (list_empty(&rdtgroup_lists))
+		goto end;
+
+	__bitmap_parse(buf, strlen(buf), 0, bitmap, nr_cpu_ids);
+
+	cpumask = to_cpumask(bitmap);
+
+	list_for_each(l, &rdtgroup_lists) {
+		r = list_entry(l, struct rdtgroup, rdtgroup_list);
+		if (r == rdtgrp)
+			continue;
+
+		for_each_cpu_and(cpu, &r->cpu_mask, cpumask)
+			cpumask_clear_cpu(cpu, &r->cpu_mask);
+	}
+
+	cpumask_copy(&rdtgrp->cpu_mask, cpumask);
+	for_each_cpu(cpu, cpumask)
+		per_cpu(cpu_rdtgroup, cpu) = rdtgrp;
+
+end:
+	rdtgroup_kn_unlock(of->kn);
+
+	return nbytes;
+}
 
 static struct rftype rdtgroup_partition_base_files[] = {
 	{
