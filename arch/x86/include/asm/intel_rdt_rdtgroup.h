@@ -205,6 +205,9 @@ struct rdtgroup_root {
 	char name[MAX_RDTGROUP_ROOT_NAMELEN];
 };
 
+extern int __init rdtgroup_init(void);
+extern bool rdtgroup_mounted;
+
 /* no synchronization, the result can only be used as a hint */
 static inline bool rdtgroup_is_populated(struct rdtgroup *rdtgrp)
 {

@@ -803,6 +803,8 @@ static int __init intel_rdt_late_init(void)
 
 	cpu_notifier_register_done();
 
+	rdtgroup_init();
+
 	static_key_slow_inc(&rdt_enable_key);
 	pr_info("Intel cache allocation enabled\n");
 	if (cpu_has(c, X86_FEATURE_CDP_L3))

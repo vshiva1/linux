@@ -42,6 +42,9 @@ struct cache_domain {
 	unsigned int shared_cache_id[MAX_CACHE_DOMAINS];
 };
 
+extern struct cache_domain cache_domains[MAX_CACHE_LEAVES];
+
+
 extern struct rdt_opts rdt_opts;
 
 struct clos_cbm_table {
