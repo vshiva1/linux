@@ -108,17 +108,19 @@ static inline bool cache_alloc_supported(struct cpuinfo_x86 *c)
 	return false;
 }
 
-
 void __intel_rdt_sched_in(void *dummy)
 {
 	struct intel_pqr_state *state = this_cpu_ptr(&pqr_state);
-	u32 closid = current->closid;
 
-	if (closid == state->closid)
+	/*
+	 * Currently closid is always 0. When  user interface is added,
+	 * closid will come from user interface.
+	 */
+	if (state->closid == 0)
 		return;
 
-	wrmsr(MSR_IA32_PQR_ASSOC, state->rmid, closid);
-	state->closid = closid;
+	wrmsr(MSR_IA32_PQR_ASSOC, state->rmid, 0);
+	state->closid = 0;
 }
 
 /*
