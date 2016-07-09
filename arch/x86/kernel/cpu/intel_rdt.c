@@ -30,7 +30,13 @@
 #include <asm/intel_rdt.h>
 
 /*
- * cctable maintains 1:1 mapping between CLOSid and cache bitmask.
+ * During cache alloc mode cctable maintains 1:1 mapping between
+ * CLOSid and l3_cbm.
+ *
+ * During CDP mode, the cctable maintains a 1:2 mapping between the closid
+ * and (dcache_cbm, icache_cbm) pair.
+ * index of a dcache_cbm for CLOSid 'n' = n << 1.
+ * index of a icache_cbm for CLOSid 'n' = n << 1 + 1
  */
 static struct clos_cbm_table *cctable;
 /*
@@ -53,6 +59,13 @@ static bool cdp_enabled;
 
 #define __DCBM_TABLE_INDEX(x)	(x << 1)
 #define __ICBM_TABLE_INDEX(x)	((x << 1) + 1)
+#define __DCBM_MSR_INDEX(x)			\
+	CBM_FROM_INDEX(__DCBM_TABLE_INDEX(x))
+#define __ICBM_MSR_INDEX(x)			\
+	CBM_FROM_INDEX(__ICBM_TABLE_INDEX(x))
+
+#define DCBM_TABLE_INDEX(x)	(x << cdp_enabled)
+#define ICBM_TABLE_INDEX(x)	((x << cdp_enabled) + cdp_enabled)
 
 struct rdt_remote_data {
 	int msr;
@@ -132,9 +145,12 @@ static inline void closid_tasks_sync(void)
 	on_each_cpu_mask(cpu_online_mask, __intel_rdt_sched_in, NULL, 1);
 }
 
+/*
+ * When cdp mode is enabled, refcnt is maintained in the dcache_cbm entry.
+ */
 static inline void closid_get(u32 closid)
 {
-	struct clos_cbm_table *cct = &cctable[closid];
+	struct clos_cbm_table *cct = &cctable[DCBM_TABLE_INDEX(closid)];
 
 	lockdep_assert_held(&rdt_group_mutex);
 
@@ -164,7 +180,7 @@ static int closid_alloc(u32 *closid)
 static inline void closid_free(u32 closid)
 {
 	clear_bit(closid, cconfig.closmap);
-	cctable[closid].l3_cbm = 0;
+	cctable[DCBM_TABLE_INDEX(closid)].l3_cbm = 0;
 
 	if (WARN_ON(!cconfig.closids_used))
 		return;
@@ -174,7 +190,7 @@ static inline void closid_free(u32 closid)
 
 static void closid_put(u32 closid)
 {
-	struct clos_cbm_table *cct = &cctable[closid];
+	struct clos_cbm_table *cct = &cctable[DCBM_TABLE_INDEX(closid)];
 
 	lockdep_assert_held(&rdt_group_mutex);
 	if (WARN_ON(!cct->clos_refcnt))
