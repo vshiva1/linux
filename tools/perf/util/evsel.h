@@ -44,6 +44,7 @@ enum {
 	PERF_EVSEL__CONFIG_TERM_CALLGRAPH,
 	PERF_EVSEL__CONFIG_TERM_STACK_USER,
 	PERF_EVSEL__CONFIG_TERM_INHERIT,
+	PERF_EVSEL__CONFIG_TERM_MAX_STACK,
 	PERF_EVSEL__CONFIG_TERM_MAX,
 };
 
@@ -56,6 +57,7 @@ struct perf_evsel_config_term {
 		bool	time;
 		char	*callgraph;
 		u64	stack_user;
+		int	max_stack;
 		bool	inherit;
 	} val;
 };
@@ -259,6 +261,8 @@ static inline char *perf_evsel__strval(struct perf_evsel *evsel,
 
 struct format_field;
 
+u64 format_field__intval(struct format_field *field, struct perf_sample *sample, bool needs_swap);
+
 struct format_field *perf_evsel__field(struct perf_evsel *evsel, const char *name);
 
 #define perf_evsel__match(evsel, t, c)		\
@@ -430,5 +434,7 @@ typedef int (*attr__fprintf_f)(FILE *, const char *, const char *, void *);
 
 int perf_event_attr__fprintf(FILE *fp, struct perf_event_attr *attr,
 			     attr__fprintf_f attr__fprintf, void *priv);
+
+char *perf_evsel__env_arch(struct perf_evsel *evsel);
 
 #endif /* __PERF_EVSEL_H */
