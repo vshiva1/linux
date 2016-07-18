@@ -21,6 +21,10 @@ static unsigned int cqm_l3_scale; /* supposedly cacheline size */
 
 #define QOS_EVENT_MASK		QOS_L3_OCCUP_EVENT_ID
 
+int total_events;
+
+
+
 /*
  * Update if enough time has passed since last read.
  *
@@ -2512,6 +2516,9 @@ static int intel_cqm_event_read(struct perf_event *event)
 		return ret;
 
 	local64_set(&event->count, count);
+
+	pr_info("reading cgruop event\n");
+
 	return 0;
 }
 
@@ -2521,6 +2528,14 @@ static inline void __intel_cqm_event_start(
 	if (!(event->hw.state & PERF_HES_STOPPED))
 		return;
 	event->hw.state &= ~PERF_HES_STOPPED;
+
+/*
+pr_info("in start cpu:%d, rmid:%d, pid:%d\n",
+		smp_processor_id(), summary.sched_rmid, event->hw.target->pid);
+
+	dump_stack();
+*/
+
 	pqr_cache_update_rmid(summary.sched_rmid, PQR_RMID_MODE_EVENT);
 }
 
@@ -2593,6 +2608,10 @@ static void intel_cqm_event_terminate(struct perf_event *event)
 	unsigned long flags;
 
 	mutex_lock(&cqm_mutex);
+
+	total_events--;
+	pr_info("destroyed event #%d\n",total_events);
+
 	/*
 	 * If there's another event in this group...
 	 */
@@ -2706,6 +2725,8 @@ static int intel_cqm_event_init(struct perf_event *event)
 
 	mutex_lock(&cqm_mutex);
 
+	total_events++;
+	pr_info("created event #%d\n",total_events);
 
 	/* Will also set rmid */
 	ret = intel_cqm_setup_event(event, &group);
