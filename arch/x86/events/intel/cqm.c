@@ -2680,6 +2680,19 @@ exit:
 	mutex_unlock(&cqm_mutex);
 }
 
+static inline bool cqm_aggr_unsupported(struct perf_event *event)
+{
+	return (event->attr.aggr_mode == AGGR_CORE ||
+		 event->attr.aggr_mode == AGGR_GLOBAL ||
+		 event->attr.aggr_mode == AGGR_SOCKET);
+}
+
+static inline bool task_systemwide(struct perf_event *event)
+{
+	return (event->attr.system_wide &&
+		(event->attach_state & PERF_ATTACH_TASK));
+}
+
 static int intel_cqm_event_init(struct perf_event *event)
 {
 	struct perf_event *group = NULL;
@@ -2699,7 +2712,9 @@ static int intel_cqm_event_init(struct perf_event *event)
 	    event->attr.exclude_host   ||
 	    event->attr.exclude_guest  ||
 	    event->attr.inherit_stat   || /* cqm groups share rmid */
-	    event->attr.sample_period) /* no sampling */
+	    event->attr.sample_period  || /* no sampling */
+	    task_systemwide(event)     || /* task and system wide */
+	    cqm_aggr_unsupported(event)) /* aggregrate modes not supported*/
 		return -EINVAL;
 
 	INIT_LIST_HEAD(&event->hw.cqm_event_groups_entry);
