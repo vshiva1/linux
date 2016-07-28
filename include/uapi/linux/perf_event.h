@@ -274,6 +274,15 @@ enum perf_event_read_format {
 #define PERF_ATTR_SIZE_VER4	104	/* add: sample_regs_intr */
 #define PERF_ATTR_SIZE_VER5	112	/* add: aux_watermark */
 
+enum aggr_mode {
+	AGGR_NONE,
+	AGGR_GLOBAL,
+	AGGR_SOCKET,
+	AGGR_CORE,
+	AGGR_THREAD,
+	AGGR_UNSET,
+};
+
 /*
  * Hardware event_id to monitor via a performance monitoring event:
  */
@@ -341,7 +350,9 @@ struct perf_event_attr {
 				use_clockid    :  1, /* use @clockid for time fields */
 				context_switch :  1, /* context switch data */
 				write_backward :  1, /* Write ring buffer from end to beginning */
-				__reserved_1   : 36;
+				aggr_mode      :  3, /* specifies aggr stat mode chosen */
+				system_wide    :  1, /* true if system wide mode */
+				__reserved_1   : 33;
 
 	union {
 		__u32		wakeup_events;	  /* wakeup every n events */

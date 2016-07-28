@@ -2,6 +2,7 @@
 #define __PERF_STATS_H
 
 #include <linux/types.h>
+#include <linux/perf_event.h>
 #include <stdio.h>
 #include "xyarray.h"
 
@@ -23,15 +24,6 @@ enum perf_stat_evsel_id {
 struct perf_stat_evsel {
 	struct stats		res_stats[3];
 	enum perf_stat_evsel_id	id;
-};
-
-enum aggr_mode {
-	AGGR_NONE,
-	AGGR_GLOBAL,
-	AGGR_SOCKET,
-	AGGR_CORE,
-	AGGR_THREAD,
-	AGGR_UNSET,
 };
 
 struct perf_stat_config {

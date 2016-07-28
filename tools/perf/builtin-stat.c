@@ -215,6 +215,9 @@ static int create_perf_stat_counter(struct perf_evsel *evsel)
 			attr->enable_on_exec = 1;
 	}
 
+	evsel->attr.aggr_mode = stat_config.aggr_mode;
+	evsel->attr.system_wide = target.system_wide;
+
 	if (target__has_cpu(&target))
 		return perf_evsel__open_per_cpu(evsel, perf_evsel__cpus(evsel));
 
