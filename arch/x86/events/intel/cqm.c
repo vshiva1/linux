@@ -2446,37 +2446,52 @@ exit_error:
 	return ret;
 }
 
+static struct prmid* prmid_from_monr(struct monr *monr, int pkgid)
+{
+	struct pmonr *pmonr = monr->pmonrs[pkgid];
+	u32 rmid;
+
+	pmonr__get_read_rmid(pmonr, &rmid, true);
+
+	return __prmid_from_rmid(pkgid, rmid);
+}
+
 /* Read current package immediately and remote pkg (if any) from cache. */
 static int __read_task_event(struct perf_event *event)
 {
-	int i, ret;
+	int i, ret = 0;
 	u64 count = 0;
 	u16 pkg_id = topology_physical_package_id(smp_processor_id());
 	struct monr *monr = monr_from_event(event);
+	struct prmid *prmid;
 
-	/* Read either local or polled occupancy from all packages. */
-	cqm_pkg_id_for_each_online(i) {
-		struct prmid *prmid;
-		u32 rmid;
-		struct pmonr *pmonr = monr->pmonrs[i];
+	/*
+	 * Return the current pkg count when its per cpu read.
+	 */
+	if (event->cpu != -1) {
+		prmid = prmid_from_monr(monr, pkg_id);
+		if (!prmid)
+			goto endread;
 
-		ret = pmonr__get_read_rmid(pmonr, &rmid, true);
-		if (ret)
+		ret = cqm_prmid_update(prmid);
+		if (ret < 0)
 			return ret;
-		if (rmid == INVALID_RMID)
-			continue;
-		prmid = __prmid_from_rmid(i, rmid);
-		if (WARN_ON_ONCE(!prmid))
-			return -1;
+		count = atomic64_read(&prmid->last_read_value);
+	}
 
-		/* update and read local for this cpu's package. */
-		if (i == pkg_id) {
-			ret = cqm_prmid_update(prmid);
-			if (ret < 0)
-				return ret;
-		}
+	/* Read polled occupancy from all remote packages. */
+	cqm_pkg_id_for_each_online(i) {
+		if (i == pkg_id)
+			continue;
+
+		prmid = prmid_from_monr(monr, i);
+
+		if (!prmid)
+			continue;
+
 		count += atomic64_read(&prmid->last_read_value);
 	}
+endread:
 	local64_set(&event->count, count);
 	return 0;
 }
