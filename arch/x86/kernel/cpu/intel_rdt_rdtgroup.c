@@ -252,7 +252,7 @@ static void rdt_info_show_cat(struct seq_file *seq, int level)
 	else
 		return;
 
-	maxid = cconfig.max_closid;
+	maxid = cconfig.catl3_max_closid;
 	for (domain = 0; domain < domain_num; domain++) {
 		seq_printf(seq, "domain %d:\n", domain);
 		shared_domain = get_shared_domain(domain, level);
@@ -1182,7 +1182,7 @@ static int get_rdtgroup_resources(struct resources *resources_set,
 			 * If no existing closid is found, allocate
 			 * a new one.
 			 */
-			ret = closid_alloc(&closid, domain);
+			ret = closid_alloc(&closid, domain, true);
 			if (ret)
 				goto err;
 			rdt_closid[domain] = closid;
@@ -2029,7 +2029,7 @@ static struct dentry *rdt_mount(struct file_system_type *fs_type,
 
 	if (rdt_opts.cdp_enabled) {
 		cdp_enabled = true;
-		cconfig.max_closid >>= cdp_enabled;
+		cconfig.catl3_max_closid >>= cdp_enabled;
 		pr_info("CDP is enabled\n");
 	}
 
@@ -2084,7 +2084,7 @@ static void rdt_kill_sb(struct super_block *sb)
 	root_rdtgrp->resource.valid = false;
 
 	/* Restore max_closid to original value. */
-	cconfig.max_closid <<= cdp_enabled;
+	cconfig.catl3_max_closid <<= cdp_enabled;
 
 	kernfs_kill_sb(sb);
 	rdtgroup_mounted = false;

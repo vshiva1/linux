@@ -718,15 +718,23 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
 		cpuid_count(0x00000010, 0, &eax, &ebx, &ecx, &edx);
 		c->x86_capability[CPUID_10_0_EBX] = ebx;
 
+		c->x86_l3_max_closid = -1;
+		c->x86_l3_max_cbm_len = -1;
+
 		if (cpu_has(c, X86_FEATURE_CAT_L3)) {
 
 			cpuid_count(0x00000010, 1, &eax, &ebx, &ecx, &edx);
 			c->x86_l3_max_closid = edx + 1;
 			c->x86_l3_max_cbm_len = eax + 1;
 			c->x86_capability[CPUID_10_1_ECX] = ecx;
-		} else {
-			c->x86_l3_max_closid = -1;
-			c->x86_l3_max_cbm_len = -1;
+		}
+
+		if (cpu_has(c, X86_FEATURE_MBE)) {
+
+			cpuid_count(0x00000010, 3, &eax, &ebx, &ecx, &edx);
+			c->x86_mbe_max_closid = edx + 1;
+			c->x86_mbe_max_thrtl = eax + 1;
+			c->x86_capability[CPUID_10_3_ECX] = ecx;
 		}
 	}
 

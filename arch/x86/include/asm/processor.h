@@ -122,6 +122,9 @@ struct cpuinfo_x86 {
 	/* Cache Allocation l3 values: */
 	u16			x86_l3_max_cbm_len;
 	u16			x86_l3_max_closid;
+	/* Memory b/w enforcement values: */
+	u16			x86_mbe_max_closid;
+	u16			x86_mbe_max_delay;
 	/* cpuid returned max cores value: */
 	u16			 x86_max_cores;
 	u16			apicid;

@@ -48,6 +48,7 @@ unsigned int min_bitmask_len = 1;
 cpumask_t rdt_l3_cpumask;
 
 bool cat_l3_enabled;
+bool mbe_enabled;
 
 struct static_key __read_mostly rdt_enable_key = STATIC_KEY_INIT_FALSE;
 struct clos_config cconfig;
@@ -135,11 +136,45 @@ u64 max_cbm(int level)
 	return (u64)~0;
 }
 
-static u32 hw_max_closid(int level)
+static u32 hw_min_closid(int level)
 {
+	u32 maxid = 0;
+
 	switch (level) {
 	case CACHE_LEVEL3:
-		return  boot_cpu_data.x86_l3_max_closid;
+		/*
+		 * MBE and L3 cat both have L3 as their domain.
+		 * If CAT is present its known to have more CLOSids than MBE.
+		 */
+		if (mbe_enabled)
+			maxid = boot_cpu_data.x86_mbe_max_closid;
+		else if (cat_l3_enabled)
+			maxid = boot_cpu_data.x86_l3_max_closid;
+
+		break;
+	default:
+		break;
+	}
+
+	return maxid;
+}
+
+static u32 hw_max_closid(int level)
+{
+	u32 maxid;
+
+	switch (level) {
+	case CACHE_LEVEL3:
+		/*
+		 * MBE and L3 cat both have L3 as their domain.
+		 * If CAT is present its known to have more CLOSids than MBE.
+		 */
+		if (cat_l3_enabled)
+			maxid = boot_cpu_data.x86_l3_max_closid;
+		else if (mbe_enabled)
+			maxid = boot_cpu_data.x86_mbe_max_closid;
+
+		return maxid;
 	default:
 		break;
 	}
@@ -169,6 +204,17 @@ bool cat_enabled(int level)
 	default:
 		break;
 	}
+
+	return false;
+}
+
+static inline bool mbe_supported(struct cpuinfo_x86 *c)
+{
+	/*
+	 * Only support MBE with linear throttling support.
+	 */
+	if (cpu_has(c, X86_FEATURE_MBE) && cpu_has(c, X86_FEATURE_MBE_LIN))
+		return true;
 
 	return false;
 }
@@ -253,14 +299,18 @@ inline void closid_get(u32 closid, int domain)
 	}
 }
 
-int closid_alloc(u32 *closid, int domain)
+int closid_alloc(u32 *closid, int domain, bool mbe_dontcare)
 {
 	u32 maxid;
 	u32 id;
 
 	lockdep_assert_held(&rdtgroup_mutex);
 
-	maxid = cconfig.max_closid;
+	if (mbe_dontcare)
+		maxid = cconfig.catl3_max_closid;
+	else
+		maxid = cconfig.mbe_max_closid;
+	
 	id = find_first_zero_bit((unsigned long *)cconfig.closmap[domain],
 				 maxid);
 
@@ -480,7 +530,7 @@ static void cbm_update_msrs(void *dummy)
 	int maxid;
 	int index;
 
-	maxid = cconfig.max_closid;
+	maxid = cconfig.catl3_max_closid;
 	if (cat_l3_enabled) {
 		for (index = 0; index < maxid; index++)
 			cbm_update_l3_msr(&index);
@@ -636,7 +686,7 @@ __setup("rscctrl=", rdt_setup);
 
 static inline bool resource_alloc_enabled(void)
 {
-	return cat_l3_enabled;
+	return cat_l3_enabled || mbe_enabled;
 }
 
 struct shared_domain *shared_domain;
@@ -651,7 +701,7 @@ static int shared_domain_init(void)
 	struct cpumask *shared_cpu_map;
 	int cpu;
 
-	if (cat_l3_enabled) {
+	if (resource_alloc_enabled()) {
 		shared_domain_num = l3_domain_num;
 		cpumask = &rdt_l3_cpumask;
 	} else
@@ -664,7 +714,7 @@ static int shared_domain_init(void)
 
 	domain = 0;
 	for_each_cpu(cpu, cpumask) {
-		if (cat_l3_enabled)
+		if (resource_alloc_enabled())
 			shared_domain[domain].l3_domain =
 					per_cpu(cpu_l3_domain, cpu);
 		else
@@ -677,7 +727,7 @@ static int shared_domain_init(void)
 		domain++;
 	}
 	for_each_online_cpu(cpu) {
-		if (cat_l3_enabled)
+		if (resource_alloc_enabled())
 			per_cpu(cpu_shared_domain, cpu) =
 					per_cpu(cpu_l3_domain, cpu);
 	}
@@ -706,7 +756,8 @@ static int cconfig_init(int maxid)
 		cconfig.closmap[domain] = (unsigned long *)closmap_block +
 					  domain * maxid_size;
 
-	cconfig.max_closid = maxid;
+	cconfig.catl3_max_closid = boot_cpu_data.x86_l3_max_closid;;
+	cconfig.mbe_max_closid = boot_cpu_data.x86_mbe_max_closid;
 
 	return 0;
 out_free:
@@ -767,6 +818,9 @@ static int __init intel_rdt_late_init(void)
 	else
 		cat_l3_enabled = false;
 
+	if (mbe_supported(c))
+		mbe_enabled = true;
+
 	if (!resource_alloc_enabled())
 		return -ENODEV;
 
@@ -779,23 +833,24 @@ static int __init intel_rdt_late_init(void)
 	}
 
 	maxid = 0;
-	if (cat_l3_enabled) {
-		maxid = boot_cpu_data.x86_l3_max_closid;
+
+	/*
+	 * MBE and CAT_l3 domain is L3.
+	 */
+	if (resource_alloc_enabled()) {
+		maxid = hw_max_closid(CACHE_LEVEL3);
 		ret = cat_cache_init(CACHE_LEVEL3, maxid, &l3_cctable);
 		if (ret)
-			cat_l3_enabled = false;
-	}
-
-	if (!cat_l3_enabled)
-		return -ENOSPC;
+			goto err;
+		}
 
 	ret = shared_domain_init();
 	if (ret)
-		return -ENODEV;
+		goto err;
 
 	ret = cconfig_init(maxid);
 	if (ret)
-		return ret;
+		goto err;
 
 	cpu_notifier_register_begin();
 
@@ -811,6 +866,11 @@ static int __init intel_rdt_late_init(void)
 		pr_info("Intel code data prioritization detected\n");
 
 	return 0;
+err:
+	cat_l3_enabled = false;
+	mbe_enabled = false;
+
+	return ret;
 }
 
 late_initcall(intel_rdt_late_init);

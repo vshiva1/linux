@@ -54,7 +54,8 @@ struct clos_cbm_table {
 
 struct clos_config {
 	unsigned long **closmap;
-	u32 max_closid;
+	u32 catl3_max_closid;
+	u32 mbe_max_closid;
 };
 
 struct shared_domain {
