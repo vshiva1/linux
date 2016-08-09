@@ -1033,14 +1033,28 @@ static bool cbm_found(struct cache_resource *l, struct rdtgroup *r,
 	u64 cctable_cbm;
 	u64 cbm;
 	int dindex;
+	bool match = false;
 
 	closid = r->resource.closid[domain];
 
 	if (level == CACHE_LEVEL3) {
-		l3_domain = shared_domain[domain].l3_domain;
-		cbm = l->cbm[l3_domain];
-		dindex = get_dcbm_table_index(closid);
-		cctable_cbm = l3_cctable[l3_domain][dindex].cbm;
+
+		if (cat_cbm_match(l, r, domain) && cdp_cbm_match(l, r, domain)
+			&& mbe_thrl_match(l, r, domain))
+			return true;
+		else
+			return false;
+
+		if (!cdp_match())
+			return match;
+
+		
+
+
+
+		if (cbm != cctable_cbm)
+			goto end;
+
 		if (cdp_enabled) {
 			u64 icbm;
 			u64 cctable_icbm;
@@ -1050,7 +1064,7 @@ static bool cbm_found(struct cache_resource *l, struct rdtgroup *r,
 			iindex = get_icbm_table_index(closid);
 			cctable_icbm = l3_cctable[l3_domain][iindex].cbm;
 
-			return cbm == cctable_cbm && icbm == cctable_icbm;
+			if  cbm == cctable_cbm && icbm == cctable_icbm;
 		}
 
 		return cbm == cctable_cbm;

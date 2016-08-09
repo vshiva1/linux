@@ -49,6 +49,7 @@ extern struct rdt_opts rdt_opts;
 
 struct clos_cbm_table {
 	unsigned long cbm;
+	unsigned long mthrtl;
 	unsigned int clos_refcnt;
 };
 
@@ -81,7 +82,7 @@ extern void msr_cpu_update(void *arg);
 extern inline void closid_get(u32 closid, int domain);
 extern void closid_put(u32 closid, int domain);
 extern void closid_free(u32 closid, int domain, int level);
-extern int closid_alloc(u32 *closid, int domain);
+extern int closid_alloc(u32 *closid, int domain, bool mbe_dontcare);
 extern struct mutex rdtgroup_mutex;
 extern bool cat_l3_enabled;
 extern unsigned int get_domain_num(int level);

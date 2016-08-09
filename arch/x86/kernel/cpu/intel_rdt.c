@@ -136,32 +136,9 @@ u64 max_cbm(int level)
 	return (u64)~0;
 }
 
-static u32 hw_min_closid(int level)
-{
-	u32 maxid = 0;
-
-	switch (level) {
-	case CACHE_LEVEL3:
-		/*
-		 * MBE and L3 cat both have L3 as their domain.
-		 * If CAT is present its known to have more CLOSids than MBE.
-		 */
-		if (mbe_enabled)
-			maxid = boot_cpu_data.x86_mbe_max_closid;
-		else if (cat_l3_enabled)
-			maxid = boot_cpu_data.x86_l3_max_closid;
-
-		break;
-	default:
-		break;
-	}
-
-	return maxid;
-}
-
 static u32 hw_max_closid(int level)
 {
-	u32 maxid;
+	u32 maxid = 0;
 
 	switch (level) {
 	case CACHE_LEVEL3:
@@ -284,18 +261,13 @@ inline void closid_get(u32 closid, int domain)
 {
 	lockdep_assert_held(&rdtgroup_mutex);
 
-	if (cat_l3_enabled) {
+	if (resource_alloc_enabled()) {
 		int l3_domain;
 		int dindex;
 
 		l3_domain = shared_domain[domain].l3_domain;
 		dindex = DCBM_TABLE_INDEX(closid);
 		l3_cctable[l3_domain][dindex].clos_refcnt++;
-		if (cdp_enabled) {
-			int iindex = ICBM_TABLE_INDEX(closid);
-
-			l3_cctable[l3_domain][iindex].clos_refcnt++;
-		}
 	}
 }
 
@@ -354,13 +326,6 @@ void closid_free(u32 closid, int domain, int level)
 
 	clear_bit(closid, (unsigned long *)cconfig.closmap[domain]);
 
-	if (level == CACHE_LEVEL3) {
-		cctable[domain][closid].cbm = max_cbm(level);
-		leaf = level_to_leaf(level);
-		mask = &cache_domains[leaf].shared_cpu_map[domain];
-		cpu = cpumask_first(mask);
-		smp_call_function_single(cpu, cbm_update_l3_msr, &closid, 1);
-	}
 }
 
 static void _closid_put(u32 closid, struct clos_cbm_table *cct,
@@ -378,15 +343,11 @@ void closid_put(u32 closid, int domain)
 {
 	struct clos_cbm_table *cct;
 
-	if (cat_l3_enabled) {
+	if (resource_alloc_enabled()) {
 		int l3_domain = shared_domain[domain].l3_domain;
 
 		cct = &l3_cctable[l3_domain][DCBM_TABLE_INDEX(closid)];
 		_closid_put(closid, cct, l3_domain, CACHE_LEVEL3);
-		if (cdp_enabled) {
-			cct = &l3_cctable[l3_domain][ICBM_TABLE_INDEX(closid)];
-			_closid_put(closid, cct, l3_domain, CACHE_LEVEL3);
-		}
 	}
 }
 
