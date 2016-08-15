@@ -733,7 +733,7 @@ void get_cpu_cap(struct cpuinfo_x86 *c)
 
 			cpuid_count(0x00000010, 3, &eax, &ebx, &ecx, &edx);
 			c->x86_mbe_max_closid = edx + 1;
-			c->x86_mbe_max_delay = eax + 1;
+			c->x86_mbe_min_thrtl = 100 - (eax + 1);
 			c->x86_capability[CPUID_10_3_ECX] = ecx;
 		}
 	}

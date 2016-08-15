@@ -7,6 +7,8 @@
 #include <asm/intel_rdt.h>
 
 extern void rdtgroup_exit(struct task_struct *tsk);
+extern bool resource_allocl3_enabled(void);
+
 
 struct pss_set {
 	void  *self;
@@ -48,6 +50,7 @@ enum {
 struct cache_resource {
 	u64 *cbm;
 	u64 *cbm2;
+	unsigned long *mthrtl;
 	int *closid;
 	int *refcnt;
 };

@@ -124,7 +124,7 @@ struct cpuinfo_x86 {
 	u16			x86_l3_max_closid;
 	/* Memory b/w enforcement values: */
 	u16			x86_mbe_max_closid;
-	u16			x86_mbe_max_delay;
+	u16			x86_mbe_min_thrtl;
 	/* cpuid returned max cores value: */
 	u16			 x86_max_cores;
 	u16			apicid;

@@ -13,11 +13,13 @@
 
 enum resource_type {
 	RESOURCE_L3  = 0,
-	RESOURCE_NUM = 1,
+	RESOURCE_MBE = 1,
+	RESOURCE_NUM = 2,
 };
 
 #define MAX_CACHE_LEAVES        4
 #define MAX_CACHE_DOMAINS       64
+#define MAX_MBE_THROTTLE        100
 
 DECLARE_PER_CPU_READ_MOSTLY(int, cpu_l3_domain);
 DECLARE_PER_CPU_READ_MOSTLY(struct rdtgroup *, cpu_rdtgroup);
@@ -102,6 +104,8 @@ extern u64 max_cbm(int level);
 extern u32 max_cbm_len(int level);
 
 extern void rdtgroup_exit(struct task_struct *tsk);
+
+extern bool mbe_enabled;
 
 /*
  * intel_rdt_sched_in() - Writes the task's CLOSid to IA32_PQR_MSR

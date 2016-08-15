@@ -54,6 +54,33 @@
 #include <asm/intel_rdt_rdtgroup.h>
 #include <asm/intel_rdt.h>
 
+struct rdt_parse {
+	char *name;
+	int (*parse_api)(char *buf, struct cache_resource *l, int level,
+				 struct rdtgroup *rdtgrp);
+};
+
+static int parse_cat_cdp(char *buf, struct cache_resource *l, int level,
+			 struct rdtgroup *rdtgrp);
+
+static int parse_mbe(char *buf, struct cache_resource *l, int level,
+			 struct rdtgroup *rdtgrp);
+
+static struct rdt_parse rdt_parse[] =
+{
+	{
+		.name = "L3",
+		.parse_api = parse_cat_cdp,
+	},
+
+	{
+		.name = "MBE",
+		.parse_api = parse_mbe,
+	},
+
+	{}
+};
+
 /**
  * kernfs_root - find out the kernfs_root a kernfs_node belongs to
  * @kn: kernfs_node of interest
@@ -332,6 +359,7 @@ static int res_type_to_level(enum resource_type res_type, int *level)
 
 	switch (res_type) {
 	case RESOURCE_L3:
+	case RESOURCE_MBE:
 		*level = CACHE_LEVEL3;
 		break;
 	case RESOURCE_NUM:
@@ -833,55 +861,6 @@ static int get_res_type(char **res, enum resource_type *res_type)
 	return -EINVAL;
 }
 
-static int divide_resources(char *buf, char *resources[RESOURCE_NUM])
-{
-	char *tok;
-	unsigned int resource_num = 0;
-	int ret = 0;
-	char *res;
-	char *res_block;
-	size_t size;
-	enum resource_type res_type;
-
-	size = strlen(buf) + 1;
-	res = kzalloc(size, GFP_KERNEL);
-	if (!res) {
-		ret = -ENOSPC;
-		goto out;
-	}
-
-	while ((tok = strsep(&buf, "\n")) != NULL) {
-		if (strlen(tok) == 0)
-			break;
-		if (resource_num++ >= 1) {
-			pr_info("More than one line of resource input!\n");
-			ret = -EINVAL;
-			goto out;
-		}
-		strcpy(res, tok);
-	}
-
-	res_block = res;
-	ret = get_res_type(&res_block, &res_type);
-	if (ret) {
-		pr_info("Unknown resource type!");
-		goto out;
-	}
-
-	if (res_type == RESOURCE_L3 && cat_enabled(CACHE_LEVEL3)) {
-		strcpy(resources[RESOURCE_L3], res_block);
-	} else {
-		pr_info("Invalid resource type!");
-		goto out;
-	}
-
-	ret = 0;
-
-out:
-	kfree(res);
-	return ret;
-}
-
 static bool cbm_validate(unsigned long var, int level)
 {
 	u32 maxcbmlen = max_cbm_len(level);
@@ -945,25 +924,58 @@ static int get_input_cbm(char *tok, struct cache_resource *l,
 	return 0;
 }
 
-
-static int get_cache_schema(char *buf, struct cache_resource *l, int level,
-			 struct rdtgroup *rdtgrp)
+static bool thrtl_validate(unsigned long mthrtl)
 {
-	char *tok, *tok_cache_id;
-	int ret;
-	int domain_num;
-	int input_domain_num;
-	int len;
-	unsigned int input_cache_id;
-	unsigned int cid;
+	u32 min_thrtl = boot_cpu_data.x86_mbe_min_thrtl;
+
+	return (mthrtl <= MAX_MBE_THROTTLE && mthrtl >= min_thrtl);
+}
+
+static int get_input_thrtl(char *tok, struct cache_resource *l,
+			 int input_domain_num, int level)
+{
+	if (tok != NULL && !kstrtoul(tok, 16,
+		       (unsigned long *)&l->mthrtl[input_domain_num]) &&
+		       thrtl_validate(l->mthrtl[input_domain_num]))
+		return 0;
+
+	return -EINVAL;
+}
+
+static unsigned int get_cid_domain(int level, int input_domain_num)
+{
 	unsigned int leaf;
 
-	if (!cat_enabled(level) && strcmp(buf, ";")) {
-		pr_info("Disabled resource should have empty schema\n");
-		return -EINVAL;
-	}
+	leaf = level_to_leaf(level);
 
-	len = strlen(buf);
+	return cache_domains[leaf].shared_cache_id[input_domain_num];
+}
+
+static int validate_cid(char *tok_cid, int level, int input_domain_num)
+{
+	unsigned int input_cid;
+
+	if (tok_cid == NULL || kstrtouint(tok_cid, 16, &input_cid))
+		return -EINVAL;
+
+	if (input_cid != get_cid_domain(level, input_domain_num))
+		return -EINVAL;
+
+	return 0;
+}
+
+static int parse_cat_cdp(char *buf, struct cache_resource *l, int level,
+			 struct rdtgroup *rdtgrp)
+{
+	unsigned int max_domain, input_domain_num;
+	char *tok, *tok_cache_id;
+
+	if (!cat_enabled(level) && strcmp(buf, ";"))
+		goto err;
+
+	input_domain_num = 0;
+	max_domain = get_domain_num(level);
+
 	/*
 	 * Translate cache id based cbm from one line string with format
 	 * "<cache prefix>:<cache id0>=xxxx;<cache id1>=xxxx;..." for
@@ -972,102 +984,163 @@ static int get_cache_schema(char *buf, struct cache_resource *l, int level,
 	 * "<cache prefix>:<cache id0>=xxxxx,xxxxx;<cache id1>=xxxxx,xxxxx;..."
 	 * for enabled cdp.
 	 */
-	input_domain_num = 0;
 	while ((tok = strsep(&buf, ";")) != NULL) {
+		if (input_domain_num >= max_domain)
+			goto err;
+
 		tok_cache_id = strsep(&tok, "=");
-		if (tok_cache_id == NULL)
-			goto cache_id_err;
+		if (validate_cid(tok_cache_id, level, input_domain_num))
+			goto err;
 
-		ret = kstrtouint(tok_cache_id, 16, &input_cache_id);
-		if (ret)
-			goto cache_id_err;
-
-		leaf = level_to_leaf(level);
-		cid = cache_domains[leaf].shared_cache_id[input_domain_num];
-		if (input_cache_id != cid)
-			goto cache_id_err;
-
-		ret = get_input_cbm(tok, l, input_domain_num, level);
-		if (ret)
-			goto cbm_err;
+		if (get_input_cbm(tok, l, input_domain_num, level))
+			goto err;
 
 		input_domain_num++;
-		if (input_domain_num > get_domain_num(level)) {
-			pr_info("domain number is more than max %d\n",
-				MAX_CACHE_DOMAINS);
-			return -EINVAL;
-		}
 	}
+	if (max_domain != input_domain_num)
+		goto err;
 
-	domain_num = get_domain_num(level);
-	if (domain_num != input_domain_num) {
-		pr_info("%s input domain number %d doesn't match domain number %d\n",
-			"l3",
-			input_domain_num, domain_num);
+	return 0;
+err:
+	pr_info("Invalid schema input for L3\n");
 
-		return -EINVAL;
+	return -EINVAL;
+}
+
+static int parse_mbe(char *buf, struct cache_resource *l, int level,
+			 struct rdtgroup *rdtgrp)
+{
+	unsigned int max_domain, input_domain_num = 0;
+	char *tok, *tok_cache_id;
+
+	if (!mbe_enabled && strcmp(buf, ";"))
+		goto err;
+
+	max_domain = get_domain_num(level);
+
+	/*
+	 * Parse the throttle values in the MBE line in the format:
+	 * "MBE:<cache id0>=thrtl_x;<cache id1>=thrtl_y;..."
+	 */
+	while ((tok = strsep(&buf, ";")) != NULL) {
+		if (input_domain_num >= max_domain)
+			goto err;
+
+		tok_cache_id = strsep(&tok, "=");
+		if (validate_cid(tok_cache_id, level, input_domain_num))
+			goto err;
+
+		if (get_input_thrtl(tok, l, input_domain_num, level))
+			goto err;
+
+		input_domain_num++;
+	}
+	if (max_domain != input_domain_num)
+		goto err;
+
+	return 0;
+err:
+	pr_info("Invalid schema input for L3\n");
+
+	return -EINVAL;
+}
+
+/*
+ * Parse the different RDT schema lines starting from ri
+ */
+static int parse_rdt_schema(char *buf, struct cache_resource *l, int level,
+			 struct rdtgroup *rdtgrp, int ri)
+{
+	char *tok, *fname;
+
+	while ((tok = strsep(&buf, "\n")) != NULL) {
+		if (ri >= RESOURCE_NUM)
+			return -EINVAL;
+
+		fname = strsep(&tok, ":");
+		if (!strcmp(fname, rdt_parse[ri].name) ||
+		    rdt_parse[ri].parse_api(tok, l, level, rdtgrp))
+			return -EINVAL;
+
+		ri++;
 	}
 
 	return 0;
-
-cache_id_err:
-	pr_info("Invalid cache id in field %d for L%1d\n", input_domain_num,
-		level);
-	return -EINVAL;
-
-cbm_err:
-	pr_info("Invalid cbm in field %d for cache L%d\n",
-		input_domain_num, level);
-	return -EINVAL;
 }
 
 struct resources {
 	struct cache_resource *l3;
 };
 
-static bool cbm_found(struct cache_resource *l, struct rdtgroup *r,
+static bool mbe_thrtl_found(struct cache_resource *l, int domain, u32 closid)
+{
+	unsigned long cctable_mthrtl;
+	unsigned long mthrtl;
+	int l3_domain;
+	int dindex;
+
+	if (!mbe_enabled)
+		return true;
+
+	l3_domain = shared_domain[domain].l3_domain;
+	mthrtl = l->mthrtl[l3_domain];
+	dindex = get_dcbm_table_index(closid);
+	cctable_mthrtl = l3_cctable[l3_domain][dindex].mthrtl;
+
+	return mthrtl == cctable_mthrtl;
+}
+
+static bool cdp_cbm_found(struct cache_resource *l, int domain, u32 closid)
+{
+	u64 cctable_icbm;
+	int l3_domain;
+	int iindex;
+	u64 icbm;
+
+	if (!cdp_enabled)
+		return true;
+
+	l3_domain = shared_domain[domain].l3_domain;
+	icbm = l->cbm2[l3_domain];
+	iindex = get_icbm_table_index(closid);
+	cctable_icbm = l3_cctable[l3_domain][iindex].cbm;
+
+	return icbm == cctable_icbm;
+}
+
+static bool cat_cbm_found(struct cache_resource *l, int domain, u32 closid)
+{
+	u64 cctable_cbm;
+	int l3_domain;
+	int dindex;
+	u64 cbm;
+
+	if (!cat_l3_enabled)
+		return true;
+
+	l3_domain = shared_domain[domain].l3_domain;
+	cbm = l->cbm[l3_domain];
+	dindex = get_dcbm_table_index(closid);
+	cctable_cbm = l3_cctable[l3_domain][dindex].cbm;
+
+	return cbm == cctable_cbm;
+}
+
+static bool cbm_thrtl_found(struct cache_resource *l, struct rdtgroup *r,
 		      int domain, int level)
 {
 	int closid;
-	int l3_domain;
-	u64 cctable_cbm;
-	u64 cbm;
-	int dindex;
-	bool match = false;
 
 	closid = r->resource.closid[domain];
 
 	if (level == CACHE_LEVEL3) {
 
-		if (cat_cbm_match(l, r, domain) && cdp_cbm_match(l, r, domain)
-			&& mbe_thrl_match(l, r, domain))
+		if (cat_cbm_found(l, domain, closid) &&
+			cdp_cbm_found(l, domain, closid) &&
+			mbe_thrtl_found(l, domain, closid))
 			return true;
 		else
 			return false;
-
-		if (!cdp_match())
-			return match;
-
-		
-
-
-
-		if (cbm != cctable_cbm)
-			goto end;
-
-		if (cdp_enabled) {
-			u64 icbm;
-			u64 cctable_icbm;
-			int iindex;
-
-			icbm = l->cbm2[l3_domain];
-			iindex = get_icbm_table_index(closid);
-			cctable_icbm = l3_cctable[l3_domain][iindex].cbm;
-
-			if  cbm == cctable_cbm && icbm == cctable_icbm;
-		}
-
-		return cbm == cctable_cbm;
 	}
 
 	return false;
@@ -1149,10 +1222,7 @@ static int get_rdtgroup_resources(struct resources *resources_set,
 				continue;
 			}
 
-			l3_cbm_found = true;
-
-			if (cat_l3_enabled)
-				l3_cbm_found = cbm_found(l3, rdtgrp, domain,
+			l3_cbm_found = cbm_thrtl_found(l3, rdtgrp, domain,
 							 CACHE_LEVEL3);
 
 			/*
@@ -1179,7 +1249,7 @@ static int get_rdtgroup_resources(struct resources *resources_set,
 				continue;
 
 			if (cat_l3_enabled)
-				l3_cbm_found = cbm_found(l3, r, domain,
+				l3_cbm_found = cbm_thrtl_found(l3, r, domain,
 							 CACHE_LEVEL3);
 
 			if (l3_cbm_found) {
@@ -1303,6 +1373,7 @@ static void init_cache_resource(struct cache_resource *l)
 {
 	l->cbm = NULL;
 	l->cbm2 = NULL;
+	l->mthrtl = NULL;
 	l->closid = NULL;
 	l->refcnt = NULL;
 }
@@ -1311,6 +1382,7 @@ static void free_cache_resource(struct cache_resource *l)
 {
 	kfree(l->cbm);
 	kfree(l->cbm2);
+	kfree(l->mthrtl);
 	kfree(l->closid);
 	kfree(l->refcnt);
 }
@@ -1321,9 +1393,10 @@ static int alloc_cache_resource(struct cache_resource *l, int level)
 
 	l->cbm = kcalloc(domain_num, sizeof(*l->cbm), GFP_KERNEL);
 	l->cbm2 = kcalloc(domain_num, sizeof(*l->cbm2), GFP_KERNEL);
+	l->mthrtl = kcalloc(domain_num, sizeof(*l->mthrtl), GFP_KERNEL);
 	l->closid = kcalloc(domain_num, sizeof(*l->closid), GFP_KERNEL);
 	l->refcnt = kcalloc(domain_num, sizeof(*l->refcnt), GFP_KERNEL);
-	if (l->cbm && l->cbm2 && l->closid && l->refcnt)
+	if (l->cbm && l->cbm2 && l->mthrtl && l->closid && l->refcnt)
 		return 0;
 
 	return -ENOMEM;
@@ -1343,36 +1416,19 @@ static int alloc_cache_resource(struct cache_resource *l, int level)
  */
 static int get_resources(char *buf, struct rdtgroup *rdtgrp)
 {
-	char *resources[RESOURCE_NUM];
 	struct cache_resource l3;
 	struct resources resources_set;
 	int ret;
-	char *resources_block;
-	int i;
-	int size = strlen(buf) + 1;
-
-	resources_block = kcalloc(RESOURCE_NUM, size, GFP_KERNEL);
-	if (!resources_block)
-		return -ENOMEM;
-
-	for (i = 0; i < RESOURCE_NUM; i++)
-		resources[i] = (char *)(resources_block + i * size);
-
-	ret = divide_resources(buf, resources);
-	if (ret) {
-		kfree(resources_block);
-		return -EINVAL;
-	}
 
 	init_cache_resource(&l3);
 
-	if (cat_l3_enabled) {
+	if (resource_allocl3_enabled()) {
 		ret = alloc_cache_resource(&l3, CACHE_LEVEL3);
 		if (ret)
 			goto out;
 
-		ret = get_cache_schema(resources[RESOURCE_L3], &l3,
-				       CACHE_LEVEL3, rdtgrp);
+		ret = parse_rdt_schema(buf, &l3, CACHE_LEVEL3,
+				       rdtgrp, RESOURCE_L3);
 		if (ret)
 			goto out;
 
@@ -1383,7 +1439,6 @@ static int get_resources(char *buf, struct rdtgroup *rdtgrp)
 	ret = get_rdtgroup_resources(&resources_set, rdtgrp);
 
 out:
-	kfree(resources_block);
 	free_cache_resource(&l3);
 
 	return ret;

@@ -160,6 +160,11 @@ static u32 hw_max_closid(int level)
 	return 0;
 }
 
+bool resource_allocl3_enabled(void)
+{
+	return cat_l3_enabled || mbe_enabled;
+}
+
 static int cbm_from_index(u32 i, int level)
 {
 	switch (level) {
@@ -261,7 +266,7 @@ inline void closid_get(u32 closid, int domain)
 {
 	lockdep_assert_held(&rdtgroup_mutex);
 
-	if (resource_alloc_enabled()) {
+	if (resource_allocl3_enabled()) {
 		int l3_domain;
 		int dindex;
 
@@ -317,15 +322,13 @@ int level_to_leaf(int level)
 void closid_free(u32 closid, int domain, int level)
 {
 	struct clos_cbm_table **cctable;
-	int leaf;
-	struct cpumask *mask;
-	int cpu;
 
-	if (level == CACHE_LEVEL3)
+	if (level == CACHE_LEVEL3) {
 		cctable = l3_cctable;
+		cctable[domain][closid].cbm = max_cbm(level);
+	}
 
 	clear_bit(closid, (unsigned long *)cconfig.closmap[domain]);
-
 }
 
 static void _closid_put(u32 closid, struct clos_cbm_table *cct,
@@ -343,7 +346,7 @@ void closid_put(u32 closid, int domain)
 {
 	struct clos_cbm_table *cct;
 
-	if (resource_alloc_enabled()) {
+	if (resource_allocl3_enabled()) {
 		int l3_domain = shared_domain[domain].l3_domain;
 
 		cct = &l3_cctable[l3_domain][DCBM_TABLE_INDEX(closid)];
@@ -645,11 +648,6 @@ static int __init rdt_setup(char *str)
 }
 __setup("rscctrl=", rdt_setup);
 
-static inline bool resource_alloc_enabled(void)
-{
-	return cat_l3_enabled || mbe_enabled;
-}
-
 struct shared_domain *shared_domain;
 int shared_domain_num;
 
@@ -662,7 +660,7 @@ static int shared_domain_init(void)
 	struct cpumask *shared_cpu_map;
 	int cpu;
 
-	if (resource_alloc_enabled()) {
+	if (resource_allocl3_enabled()) {
 		shared_domain_num = l3_domain_num;
 		cpumask = &rdt_l3_cpumask;
 	} else
@@ -675,7 +673,7 @@ static int shared_domain_init(void)
 
 	domain = 0;
 	for_each_cpu(cpu, cpumask) {
-		if (resource_alloc_enabled())
+		if (resource_allocl3_enabled())
 			shared_domain[domain].l3_domain =
 					per_cpu(cpu_l3_domain, cpu);
 		else
@@ -688,7 +686,7 @@ static int shared_domain_init(void)
 		domain++;
 	}
 	for_each_online_cpu(cpu) {
-		if (resource_alloc_enabled())
+		if (resource_allocl3_enabled())
 			per_cpu(cpu_shared_domain, cpu) =
 					per_cpu(cpu_l3_domain, cpu);
 	}
@@ -782,7 +780,7 @@ static int __init intel_rdt_late_init(void)
 	if (mbe_supported(c))
 		mbe_enabled = true;
 
-	if (!resource_alloc_enabled())
+	if (!resource_allocl3_enabled())
 		return -ENODEV;
 
 	if (rdt_opts.simulate_cat_l3) {
@@ -798,7 +796,7 @@ static int __init intel_rdt_late_init(void)
 	/*
 	 * MBE and CAT_l3 domain is L3.
 	 */
-	if (resource_alloc_enabled()) {
+	if (resource_allocl3_enabled()) {
 		maxid = hw_max_closid(CACHE_LEVEL3);
 		ret = cat_cache_init(CACHE_LEVEL3, maxid, &l3_cctable);
 		if (ret)
