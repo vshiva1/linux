@@ -174,6 +174,13 @@ u32 __get_rmid(int domain)
 	return entry->rmid;
 }
 
+static void cqm_schedule_rmidwork(int domain);
+
+static inline bool is_first_cqmwork(int domain)
+{
+	return (!atomic_cmpxchg(&cqm_pkgs_data[domain]->reuse_scheduled, 0, 1));
+}
+
 static void __put_rmid(u32 rmid, int domain)
 {
 	struct cqm_rmid_entry *entry;
@@ -293,6 +300,93 @@ static void cqm_mask_call(struct rmid_read *rr)
  */
 static unsigned int __intel_cqm_threshold;
 static unsigned int __intel_cqm_max_threshold;
+
+/*
+ * Test whether an RMID has a zero occupancy value on this cpu.
+ */
+static void intel_cqm_stable(void)
+{
+	struct cqm_rmid_entry *entry;
+	struct list_head *llist;
+
+	llist = &cqm_pkgs_data[pkg_id]->cqm_rmid_limbo_lru;
+	list_for_each_entry(entry, llist, list) {
+
+		if (__rmid_read(entry->rmid) < __intel_cqm_threshold)
+			entry->state = RMID_AVAILABLE;
+	}
+}
+
+static void __intel_cqm_rmid_reuse(void)
+{
+	struct cqm_rmid_entry *entry, *tmp;
+	struct list_head *llist, *flist;
+	struct pkg_data *pdata;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&cache_lock, flags);
+	pdata = cqm_pkgs_data[pkg_id];
+	llist = &pdata->cqm_rmid_limbo_lru;
+	flist = &pdata->cqm_rmid_free_lru;
+
+	if (list_empty(llist))
+		goto end;
+	/*
+	 * Test whether an RMID is free
+	 */
+	intel_cqm_stable();
+
+	list_for_each_entry_safe(entry, tmp, llist, list) {
+
+		if (entry->state == RMID_DIRTY)
+			continue;
+		/*
+		 * Otherwise remove from limbo and place it onto the free list.
+		 */
+		list_del(&entry->list);
+		list_add_tail(&entry->list, flist);
+	}
+
+end:
+	raw_spin_unlock_irqrestore(&cache_lock, flags);
+}
+
+static bool reschedule_cqm_work(void)
+{
+	unsigned long flags;
+	bool nwork = false;
+
+	raw_spin_lock_irqsave(&cache_lock, flags);
+
+	if (!list_empty(&cqm_pkgs_data[pkg_id]->cqm_rmid_limbo_lru))
+		nwork = true;
+	else
+		atomic_set(&cqm_pkgs_data[pkg_id]->reuse_scheduled, 0U);
+
+	raw_spin_unlock_irqrestore(&cache_lock, flags);
+
+	return nwork;
+}
+
+static void cqm_schedule_rmidwork(int domain)
+{
+	struct delayed_work *dwork;
+	unsigned long delay;
+
+	dwork = &cqm_pkgs_data[domain]->intel_cqm_rmid_work;
+	delay = msecs_to_jiffies(RMID_DEFAULT_QUEUE_TIME);
+
+	schedule_delayed_work_on(cqm_pkgs_data[domain]->rmid_work_cpu,
+			     dwork, delay);
+}
+
+static void intel_cqm_rmid_reuse(struct work_struct *work)
+{
+	__intel_cqm_rmid_reuse();
+
+	if (reschedule_cqm_work())
+		cqm_schedule_rmidwork(pkg_id);
+}
 
 static struct pmu intel_cqm_pmu;
 
@@ -547,6 +641,8 @@ static int intel_cqm_setup_event(struct perf_event *event,
 	event->hw.cqm_rmid = kzalloc(sizet, GFP_KERNEL);
 	if (!event->hw.cqm_rmid)
 		return -ENOMEM;
+
+	cqm_assign_rmid(event, event->hw.cqm_rmid);
 
 	return 0;
 }
@@ -863,6 +959,7 @@ static void intel_cqm_event_terminate(struct perf_event *event)
 {
 	struct perf_event *group_other = NULL;
 	unsigned long flags;
+	int d;
 
 	mutex_lock(&cache_mutex);
 	/*
@@ -905,6 +1002,13 @@ static void intel_cqm_event_terminate(struct perf_event *event)
 		mbm_stop_timers();
 
 	mutex_unlock(&cache_mutex);
+
+	for (d = 0; d < cqm_socket_max; d++) {
+
+		if (cqm_pkgs_data[d] != NULL && is_first_cqmwork(d)) {
+			cqm_schedule_rmidwork(d);
+		}
+	}
 }
 
 static int intel_cqm_event_init(struct perf_event *event)
@@ -1321,6 +1425,9 @@ static int pkg_data_init_cpu(int cpu)
 
 	mutex_init(&pkg_data->pkg_data_mutex);
 	raw_spin_lock_init(&pkg_data->pkg_data_lock);
+
+	INIT_DEFERRABLE_WORK(
+		&pkg_data->intel_cqm_rmid_work, intel_cqm_rmid_reuse);
 
 	pkg_data->rmid_work_cpu = cpu;
 
