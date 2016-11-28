@@ -18,11 +18,22 @@
  */
 struct intel_pqr_state {
 	u32			rmid;
+	u32			next_task_rmid;
 	u32			closid;
 	int			rmid_usecnt;
 };
 
 DECLARE_PER_CPU(struct intel_pqr_state, pqr_state);
+
+u32 __get_rmid(int domain);
+bool __rmid_valid(u32 rmid);
+void alloc_needed_pkg_rmid(u32 *cqm_rmid);
+struct cgrp_cqm_info *cqminfo_from_tsk(struct task_struct *tsk);
+
+extern struct cgrp_cqm_info cqm_rootcginfo;
+
+DECLARE_STATIC_KEY_FALSE(cqm_enable_key);
+DECLARE_STATIC_KEY_FALSE(rdt_enable_key);
 
 /**
  * struct cgrp_cqm_info - perf_event cgroup metadata for cqm

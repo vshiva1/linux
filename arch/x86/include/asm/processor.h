@@ -22,6 +22,7 @@ struct vm86;
 #include <asm/nops.h>
 #include <asm/special_insns.h>
 #include <asm/fpu/types.h>
+#include <asm/intel_pqr_common.h>
 
 #include <linux/personality.h>
 #include <linux/cache.h>
@@ -903,4 +904,7 @@ bool xen_set_default_idle(void);
 
 void stop_this_cpu(void *dummy);
 void df_debug(struct pt_regs *regs, long error_code);
+
+#define finish_arch_pre_lock_switch intel_rdt_sched_in
+
 #endif /* _ASM_X86_PROCESSOR_H */

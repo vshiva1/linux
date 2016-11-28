@@ -206,7 +206,7 @@ static void rdt_update_cpu_closid(void *closid)
 	 * executing task might have its own closid selected. Just reuse
 	 * the context switch code.
 	 */
-	intel_rdt_sched_in();
+	__intel_rdt_sched_in();
 }
 
 /*
@@ -328,7 +328,7 @@ static void move_myself(struct callback_head *head)
 
 	preempt_disable();
 	/* update PQR_ASSOC MSR to make resource group go into effect */
-	intel_rdt_sched_in();
+	__intel_rdt_sched_in();
 	preempt_enable();
 
 	kfree(callback);
