@@ -741,7 +741,13 @@ static int intel_cqm_event_init(struct perf_event *event)
 	INIT_LIST_HEAD(&event->hw.cqm_group_entry);
 	INIT_LIST_HEAD(&event->hw.cqm_groups_entry);
 
-	event->destroy = intel_cqm_event_destroy;
+	/*
+	 * CQM driver handles cgroup recursion and since only noe
+	 * RMID can be programmed at the time in each core, then
+	 * it is incompatible with the way generic code handles
+	 * cgroup hierarchies.
+	 */
+	event->event_caps |= PERF_EV_CAP_CGROUP_NO_RECURSION;
 
 	mutex_lock(&cache_mutex);
 
@@ -918,6 +924,17 @@ static struct pmu intel_cqm_pmu = {
 	.read		     = intel_cqm_event_read,
 	.count		     = intel_cqm_event_count,
 };
+#ifdef CONFIG_CGROUP_PERF
+int perf_cgroup_arch_css_alloc(struct cgroup_subsys_state *parent_css,
+				      struct cgroup_subsys_state *new_css)
+{}
+void perf_cgroup_arch_css_free(struct cgroup_subsys_state *css)
+{}
+void perf_cgroup_arch_attach(struct cgroup_taskset *tset)
+{}
+int perf_cgroup_arch_can_attach(struct cgroup_taskset *tset)
+{}
+#endif
 
 static inline void cqm_pick_event_reader(int cpu)
 {

@@ -590,6 +590,9 @@ perf_cgroup_match(struct perf_event *event)
 	if (!cpuctx->cgrp)
 		return false;
 
+	if (event->event_caps & PERF_EV_CAP_CGROUP_NO_RECURSION)
+		return cpuctx->cgrp->css.cgroup == event->cgrp->css.cgroup;
+
 	/*
 	 * Cgroup scoping is recursive.  An event enabled for a cgroup is
 	 * also enabled for all its descendant cgroups.  If @cpuctx's
@@ -606,7 +609,7 @@ static inline void perf_detach_cgroup(struct perf_event *event)
 	event->cgrp = NULL;
 }
 
-static inline int is_cgroup_event(struct perf_event *event)
+int is_cgroup_event(struct perf_event *event)
 {
 	return event->cgrp != NULL;
 }
@@ -4018,6 +4021,9 @@ static void _free_event(struct perf_event *event)
 		ring_buffer_attach(event, NULL);
 		mutex_unlock(&event->mmap_mutex);
 	}
+
+	if (event->pmu->event_terminate)
+		event->pmu->event_terminate(event);
 
 	if (is_cgroup_event(event))
 		perf_detach_cgroup(event);
@@ -9246,6 +9252,8 @@ err_per_task:
 	exclusive_event_destroy(event);
 
 err_pmu:
+	if (event->pmu->event_terminate)
+		event->pmu->event_terminate(event);
 	if (event->destroy)
 		event->destroy(event);
 	module_put(pmu->module);
@@ -10748,6 +10756,7 @@ static struct cgroup_subsys_state *
 perf_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 {
 	struct perf_cgroup *jc;
+	int ret;
 
 	jc = kzalloc(sizeof(*jc), GFP_KERNEL);
 	if (!jc)
@@ -10759,12 +10768,20 @@ perf_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
 		return ERR_PTR(-ENOMEM);
 	}
 
+	jc->arch_info = NULL;
+
+	ret = perf_cgroup_arch_css_alloc(parent_css, &jc->css);
+	if (ret)
+		return ERR_PTR(ret);
+
 	return &jc->css;
 }
 
 static void perf_cgroup_css_free(struct cgroup_subsys_state *css)
 {
 	struct perf_cgroup *jc = container_of(css, struct perf_cgroup, css);
+
+	perf_cgroup_arch_css_free(css);
 
 	free_percpu(jc->info);
 	kfree(jc);
@@ -10786,11 +10803,20 @@ static void perf_cgroup_attach(struct cgroup_taskset *tset)
 
 	cgroup_taskset_for_each(task, css, tset)
 		task_function_call(task, __perf_cgroup_move, task);
+
+	perf_cgroup_arch_attach(tset);
 }
+
+static int perf_cgroup_can_attach(struct cgroup_taskset *tset)
+{
+	return perf_cgroup_arch_can_attach(tset);
+}
+
 
 struct cgroup_subsys perf_event_cgrp_subsys = {
 	.css_alloc	= perf_cgroup_css_alloc,
 	.css_free	= perf_cgroup_css_free,
+	.can_attach	= perf_cgroup_can_attach,
 	.attach		= perf_cgroup_attach,
 };
 #endif /* CONFIG_CGROUP_PERF */

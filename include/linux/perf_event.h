@@ -300,6 +300,12 @@ struct pmu {
 	int (*event_init)		(struct perf_event *event);
 
 	/*
+	 * Terminate the event for this PMU. Optional complement for a
+	 * successful event_init. Called before the event fields are tear down.
+	 */
+	void (*event_terminate)		(struct perf_event *event);
+
+	/*
 	 * Notification that the event was mapped or unmapped.  Called
 	 * in the context of the mapping task.
 	 */
@@ -516,9 +522,13 @@ typedef void (*perf_overflow_handler_t)(struct perf_event *,
  * PERF_EV_CAP_SOFTWARE: Is a software event.
  * PERF_EV_CAP_READ_ACTIVE_PKG: A CPU event (or cgroup event) that can be read
  * from any CPU in the package where it is active.
+ * PERF_EV_CAP_CGROUP_NO_RECURSION: A cgroup event that handles its own
+ * cgroup scoping. It does not need to be enabled for all of its descendants
+ * cgroups.
  */
 #define PERF_EV_CAP_SOFTWARE		BIT(0)
 #define PERF_EV_CAP_READ_ACTIVE_PKG	BIT(1)
+#define PERF_EV_CAP_CGROUP_NO_RECURSION	BIT(2)
 
 #define SWEVENT_HLIST_BITS		8
 #define SWEVENT_HLIST_SIZE		(1 << SWEVENT_HLIST_BITS)
@@ -823,6 +833,8 @@ struct perf_cgroup_info {
 };
 
 struct perf_cgroup {
+	/* Architecture specific information. */
+	void				 *arch_info;
 	struct cgroup_subsys_state	css;
 	struct perf_cgroup_info	__percpu *info;
 };
@@ -844,6 +856,7 @@ perf_cgroup_from_task(struct task_struct *task, struct perf_event_context *ctx)
 
 #ifdef CONFIG_PERF_EVENTS
 
+extern int is_cgroup_event(struct perf_event *event);
 extern void *perf_aux_output_begin(struct perf_output_handle *handle,
 				   struct perf_event *event);
 extern void perf_aux_output_end(struct perf_output_handle *handle,
@@ -1385,6 +1398,25 @@ int perf_event_exit_cpu(unsigned int cpu);
 #else
 #define perf_event_init_cpu	NULL
 #define perf_event_exit_cpu	NULL
+#endif
+
+/*
+ * Hooks for architecture specific extensions for perf_cgroup.
+ */
+#ifndef perf_cgroup_arch_css_alloc
+#define perf_cgroup_arch_css_alloc(parent_css, new_css) 0
+#endif
+
+#ifndef perf_cgroup_arch_css_free
+#define perf_cgroup_arch_css_free(css) do { } while (0)
+#endif
+
+#ifndef perf_cgroup_arch_attach
+#define perf_cgroup_arch_attach(tskset) do { } while (0)
+#endif
+
+#ifndef perf_cgroup_arch_can_attach
+#define perf_cgroup_arch_can_attach(tskset) 0
 #endif
 
 #endif /* _LINUX_PERF_EVENT_H */
