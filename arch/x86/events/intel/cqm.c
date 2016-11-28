@@ -11,6 +11,7 @@
 #include <asm/cpu_device_id.h>
 #include <asm/intel_rdt_common.h>
 #include "../perf_event.h"
+#include "cqm.h"
 
 #define MSR_IA32_QM_CTR		0x0c8e
 #define MSR_IA32_QM_EVTSEL	0x0c8d
@@ -25,7 +26,7 @@
 static u32 cqm_max_rmid = -1;
 static unsigned int cqm_l3_scale; /* supposedly cacheline size */
 static bool cqm_enabled, mbm_enabled;
-unsigned int mbm_socket_max;
+unsigned int cqm_socket_max;
 
 /*
  * The cached intel_pqr_state is strictly per CPU and can never be
@@ -82,6 +83,8 @@ static LIST_HEAD(cache_groups);
  * Mask of CPUs for reading CQM values. We only need one per-socket.
  */
 static cpumask_t cqm_cpumask;
+
+struct pkg_data **cqm_pkgs_data;
 
 #define RMID_VAL_ERROR		(1ULL << 63)
 #define RMID_VAL_UNAVAIL	(1ULL << 62)
@@ -142,50 +145,11 @@ struct cqm_rmid_entry {
 	unsigned long queue_time;
 };
 
-/*
- * cqm_rmid_free_lru - A least recently used list of RMIDs.
- *
- * Oldest entry at the head, newest (most recently used) entry at the
- * tail. This list is never traversed, it's only used to keep track of
- * the lru order. That is, we only pick entries of the head or insert
- * them on the tail.
- *
- * All entries on the list are 'free', and their RMIDs are not currently
- * in use. To mark an RMID as in use, remove its entry from the lru
- * list.
- *
- *
- * cqm_rmid_limbo_lru - list of currently unused but (potentially) dirty RMIDs.
- *
- * This list is contains RMIDs that no one is currently using but that
- * may have a non-zero occupancy value associated with them. The
- * rotation worker moves RMIDs from the limbo list to the free list once
- * the occupancy value drops below __intel_cqm_threshold.
- *
- * Both lists are protected by cache_mutex.
- */
-static LIST_HEAD(cqm_rmid_free_lru);
-static LIST_HEAD(cqm_rmid_limbo_lru);
-
-/*
- * We use a simple array of pointers so that we can lookup a struct
- * cqm_rmid_entry in O(1). This alleviates the callers of __get_rmid()
- * and __put_rmid() from having to worry about dealing with struct
- * cqm_rmid_entry - they just deal with rmids, i.e. integers.
- *
- * Once this array is initialized it is read-only. No locks are required
- * to access it.
- *
- * All entries for all RMIDs can be looked up in the this array at all
- * times.
- */
-static struct cqm_rmid_entry **cqm_rmid_ptrs;
-
-static inline struct cqm_rmid_entry *__rmid_entry(u32 rmid)
+static inline struct cqm_rmid_entry *__rmid_entry(u32 rmid, int domain)
 {
 	struct cqm_rmid_entry *entry;
 
-	entry = cqm_rmid_ptrs[rmid];
+	entry = &cqm_pkgs_data[domain]->cqm_rmid_ptrs[rmid];
 	WARN_ON(entry->rmid != rmid);
 
 	return entry;
@@ -196,90 +160,55 @@ static inline struct cqm_rmid_entry *__rmid_entry(u32 rmid)
  *
  * We expect to be called with cache_mutex held.
  */
-static u32 __get_rmid(void)
+static u32 __get_rmid(int domain)
 {
+	struct list_head *cqm_flist;
 	struct cqm_rmid_entry *entry;
 
-	lockdep_assert_held(&cache_mutex);
+	lockdep_assert_held(&cache_lock);
 
-	if (list_empty(&cqm_rmid_free_lru))
+	cqm_flist = &cqm_pkgs_data[domain]->cqm_rmid_free_lru;
+
+	if (list_empty(cqm_flist))
 		return INVALID_RMID;
 
-	entry = list_first_entry(&cqm_rmid_free_lru, struct cqm_rmid_entry, list);
+	entry = list_first_entry(cqm_flist, struct cqm_rmid_entry, list);
 	list_del(&entry->list);
 
 	return entry->rmid;
 }
 
-static void __put_rmid(u32 rmid)
+static void __put_rmid(u32 rmid, int domain)
 {
 	struct cqm_rmid_entry *entry;
 
-	lockdep_assert_held(&cache_mutex);
+	lockdep_assert_held(&cache_lock);
 
-	WARN_ON(!__rmid_valid(rmid));
-	entry = __rmid_entry(rmid);
+	WARN_ON(!rmid);
+	entry = __rmid_entry(rmid, domain);
 
 	entry->queue_time = jiffies;
 	entry->state = RMID_DIRTY;
 
-	list_add_tail(&entry->list, &cqm_rmid_limbo_lru);
+	list_add_tail(&entry->list, &cqm_pkgs_data[domain]->cqm_rmid_limbo_lru);
 }
 
 static void cqm_cleanup(void)
 {
 	int i;
 
-	if (!cqm_rmid_ptrs)
+	if (!cqm_pkgs_data)
 		return;
 
-	for (i = 0; i < cqm_max_rmid; i++)
-		kfree(cqm_rmid_ptrs[i]);
-
-	kfree(cqm_rmid_ptrs);
-	cqm_rmid_ptrs = NULL;
-	cqm_enabled = false;
-}
-
-static int intel_cqm_setup_rmid_cache(void)
-{
-	struct cqm_rmid_entry *entry;
-	unsigned int nr_rmids;
-	int r = 0;
-
-	nr_rmids = cqm_max_rmid + 1;
-	cqm_rmid_ptrs = kzalloc(sizeof(struct cqm_rmid_entry *) *
-				nr_rmids, GFP_KERNEL);
-	if (!cqm_rmid_ptrs)
-		return -ENOMEM;
-
-	for (; r <= cqm_max_rmid; r++) {
-		struct cqm_rmid_entry *entry;
-
-		entry = kmalloc(sizeof(*entry), GFP_KERNEL);
-		if (!entry)
-			goto fail;
-
-		INIT_LIST_HEAD(&entry->list);
-		entry->rmid = r;
-		cqm_rmid_ptrs[r] = entry;
-
-		list_add_tail(&entry->list, &cqm_rmid_free_lru);
+	for (i = 0; i < cqm_socket_max; i++) {
+		if (cqm_pkgs_data[i]) {
+			kfree(cqm_pkgs_data[i]->cqm_rmid_ptrs);
+			kfree(cqm_pkgs_data[i]);
+		}
 	}
-
-	/*
-	 * RMID 0 is special and is always allocated. It's used for all
-	 * tasks that are not monitored.
-	 */
-	entry = __rmid_entry(0);
-	list_del(&entry->list);
-
-	return 0;
-
-fail:
-	cqm_cleanup();
-	return -ENOMEM;
+	kfree(cqm_pkgs_data);
 }
+
 
 /*
  * Determine if @a and @b measure the same set of tasks.
@@ -333,13 +262,13 @@ static inline struct perf_cgroup *event_to_cgroup(struct perf_event *event)
 #endif
 
 struct rmid_read {
-	u32 rmid;
+	u32 *rmid;
 	u32 evt_type;
 	atomic64_t value;
 };
 
 static void __intel_cqm_event_count(void *info);
-static void init_mbm_sample(u32 rmid, u32 evt_type);
+static void init_mbm_sample(u32 *rmid, u32 evt_type);
 static void __intel_mbm_event_count(void *info);
 
 static bool is_cqm_event(int e)
@@ -420,10 +349,11 @@ static void __intel_mbm_event_init(void *info)
 {
 	struct rmid_read *rr = info;
 
-	update_sample(rr->rmid, rr->evt_type, 1);
+	if (__rmid_valid(rr->rmid[pkg_id]))
+		update_sample(rr->rmid[pkg_id], rr->evt_type, 1);
 }
 
-static void init_mbm_sample(u32 rmid, u32 evt_type)
+static void init_mbm_sample(u32 *rmid, u32 evt_type)
 {
 	struct rmid_read rr = {
 		.rmid = rmid,
@@ -444,7 +374,7 @@ static int intel_cqm_setup_event(struct perf_event *event,
 				  struct perf_event **group)
 {
 	struct perf_event *iter;
-	u32 rmid;
+	u32 *rmid, sizet;
 
 	event->hw.is_group_event = false;
 	list_for_each_entry(iter, &cache_groups, hw.cqm_groups_entry) {
@@ -454,24 +384,20 @@ static int intel_cqm_setup_event(struct perf_event *event,
 			/* All tasks in a group share an RMID */
 			event->hw.cqm_rmid = rmid;
 			*group = iter;
-			if (is_mbm_event(event->attr.config) && __rmid_valid(rmid))
+			if (is_mbm_event(event->attr.config))
 				init_mbm_sample(rmid, event->attr.config);
 			return 0;
 		}
-
 	}
 
-	rmid = __get_rmid();
-
-	if (!__rmid_valid(rmid)) {
-		pr_info("out of RMIDs\n");
-		return -EINVAL;
-	}
-
-	if (is_mbm_event(event->attr.config) && __rmid_valid(rmid))
-		init_mbm_sample(rmid, event->attr.config);
-
-	event->hw.cqm_rmid = rmid;
+	/*
+	 * RMIDs are allocated in LAZY mode by default only when
+	 * tasks monitored are scheduled in.
+	 */
+	sizet = sizeof(u32) * cqm_socket_max;
+	event->hw.cqm_rmid = kzalloc(sizet, GFP_KERNEL);
+	if (!event->hw.cqm_rmid)
+		return -ENOMEM;
 
 	return 0;
 }
@@ -489,7 +415,7 @@ static void intel_cqm_event_read(struct perf_event *event)
 		return;
 
 	raw_spin_lock_irqsave(&cache_lock, flags);
-	rmid = event->hw.cqm_rmid;
+	rmid = event->hw.cqm_rmid[pkg_id];
 
 	if (!__rmid_valid(rmid))
 		goto out;
@@ -515,12 +441,12 @@ static void __intel_cqm_event_count(void *info)
 	struct rmid_read *rr = info;
 	u64 val;
 
-	val = __rmid_read(rr->rmid);
-
-	if (val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL))
-		return;
-
-	atomic64_add(val, &rr->value);
+	if (__rmid_valid(rr->rmid[pkg_id])) {
+		val = __rmid_read(rr->rmid[pkg_id]);
+		if (val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL))
+			return;
+		atomic64_add(val, &rr->value);
+	}
 }
 
 static inline bool cqm_group_leader(struct perf_event *event)
@@ -533,10 +459,12 @@ static void __intel_mbm_event_count(void *info)
 	struct rmid_read *rr = info;
 	u64 val;
 
-	val = rmid_read_mbm(rr->rmid, rr->evt_type);
-	if (val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL))
-		return;
-	atomic64_add(val, &rr->value);
+	if (__rmid_valid(rr->rmid[pkg_id])) {
+		val = rmid_read_mbm(rr->rmid[pkg_id], rr->evt_type);
+		if (val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL))
+			return;
+		atomic64_add(val, &rr->value);
+	}
 }
 
 static enum hrtimer_restart mbm_hrtimer_handle(struct hrtimer *hrtimer)
@@ -559,7 +487,7 @@ static enum hrtimer_restart mbm_hrtimer_handle(struct hrtimer *hrtimer)
 	}
 
 	list_for_each_entry(iter, &cache_groups, hw.cqm_groups_entry) {
-		grp_rmid = iter->hw.cqm_rmid;
+		grp_rmid = iter->hw.cqm_rmid[pkg_id];
 		if (!__rmid_valid(grp_rmid))
 			continue;
 		if (is_mbm_event(iter->attr.config))
@@ -572,7 +500,7 @@ static enum hrtimer_restart mbm_hrtimer_handle(struct hrtimer *hrtimer)
 			if (!iter1->hw.is_group_event)
 				break;
 			if (is_mbm_event(iter1->attr.config))
-				update_sample(iter1->hw.cqm_rmid,
+				update_sample(iter1->hw.cqm_rmid[pkg_id],
 					      iter1->attr.config, 0);
 		}
 	}
@@ -610,7 +538,7 @@ static void mbm_hrtimer_init(void)
 	struct hrtimer *hr;
 	int i;
 
-	for (i = 0; i < mbm_socket_max; i++) {
+	for (i = 0; i < cqm_socket_max; i++) {
 		hr = &mbm_timers[i];
 		hrtimer_init(hr, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 		hr->function = mbm_hrtimer_handle;
@@ -667,16 +595,39 @@ out:
 	return __perf_event_count(event);
 }
 
+void alloc_needed_pkg_rmid(u32 *cqm_rmid)
+{
+	unsigned long flags;
+	u32 rmid;
+
+	if (WARN_ON(!cqm_rmid))
+		return;
+
+	if (cqm_rmid[pkg_id])
+		return;
+
+	raw_spin_lock_irqsave(&cache_lock, flags);
+
+	rmid = __get_rmid(pkg_id);
+	if (__rmid_valid(rmid))
+		cqm_rmid[pkg_id] = rmid;
+
+	raw_spin_unlock_irqrestore(&cache_lock, flags);
+}
+
 static void intel_cqm_event_start(struct perf_event *event, int mode)
 {
 	struct intel_pqr_state *state = this_cpu_ptr(&pqr_state);
-	u32 rmid = event->hw.cqm_rmid;
+	u32 rmid;
 
 	if (!(event->hw.cqm_state & PERF_HES_STOPPED))
 		return;
 
 	event->hw.cqm_state &= ~PERF_HES_STOPPED;
 
+	alloc_needed_pkg_rmid(event->hw.cqm_rmid);
+
+	rmid = event->hw.cqm_rmid[pkg_id];
 	state->rmid = rmid;
 	wrmsr(MSR_IA32_PQR_ASSOC, rmid, state->closid);
 }
@@ -691,22 +642,27 @@ static void intel_cqm_event_stop(struct perf_event *event, int mode)
 
 static int intel_cqm_event_add(struct perf_event *event, int mode)
 {
-	unsigned long flags;
-	u32 rmid;
-
-	raw_spin_lock_irqsave(&cache_lock, flags);
-
 	event->hw.cqm_state = PERF_HES_STOPPED;
-	rmid = event->hw.cqm_rmid;
 
-	if (__rmid_valid(rmid) && (mode & PERF_EF_START))
+	if ((mode & PERF_EF_START))
 		intel_cqm_event_start(event, mode);
-
-	raw_spin_unlock_irqrestore(&cache_lock, flags);
 
 	return 0;
 }
 
+static inline void
+	cqm_event_free_rmid(struct perf_event *event)
+{
+	u32 *rmid = event->hw.cqm_rmid;
+	int d;
+
+	for (d = 0; d < cqm_socket_max; d++) {
+		if (__rmid_valid(rmid[d]))
+			__put_rmid(rmid[d], d);
+	}
+	kfree(event->hw.cqm_rmid);
+	list_del(&event->hw.cqm_groups_entry);
+}
 static void intel_cqm_event_destroy(struct perf_event *event)
 {
 	struct perf_event *group_other = NULL;
@@ -737,16 +693,11 @@ static void intel_cqm_event_destroy(struct perf_event *event)
 		 * If there was a group_other, make that leader, otherwise
 		 * destroy the group and return the RMID.
 		 */
-		if (group_other) {
+		if (group_other)
 			list_replace(&event->hw.cqm_groups_entry,
 				     &group_other->hw.cqm_groups_entry);
-		} else {
-			u32 rmid = event->hw.cqm_rmid;
-
-			if (__rmid_valid(rmid))
-				__put_rmid(rmid);
-			list_del(&event->hw.cqm_groups_entry);
-		}
+		else
+			cqm_event_free_rmid(event);
 	}
 
 	raw_spin_unlock_irqrestore(&cache_lock, flags);
@@ -794,7 +745,7 @@ static int intel_cqm_event_init(struct perf_event *event)
 
 	mutex_lock(&cache_mutex);
 
-	/* Will also set rmid, return error on RMID not being available*/
+	/* Delay allocating RMIDs */
 	if (intel_cqm_setup_event(event, &group)) {
 		ret = -EINVAL;
 		goto out;
@@ -1036,12 +987,95 @@ static const struct x86_cpu_id intel_mbm_total_match[] = {
 	{}
 };
 
+static int pkg_data_init_cpu(int cpu)
+{
+	struct cqm_rmid_entry *ccqm_rmid_ptrs = NULL, *entry = NULL;
+	int curr_pkgid = topology_physical_package_id(cpu);
+	struct pkg_data *pkg_data = NULL;
+	int i = 0, nr_rmids, ret = 0;
+
+	if (cqm_pkgs_data[curr_pkgid])
+		return 0;
+
+	pkg_data = kzalloc_node(sizeof(struct pkg_data),
+				GFP_KERNEL, cpu_to_node(cpu));
+	if (!pkg_data)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&pkg_data->cqm_rmid_free_lru);
+	INIT_LIST_HEAD(&pkg_data->cqm_rmid_limbo_lru);
+
+	mutex_init(&pkg_data->pkg_data_mutex);
+	raw_spin_lock_init(&pkg_data->pkg_data_lock);
+
+	pkg_data->rmid_work_cpu = cpu;
+
+	nr_rmids = cqm_max_rmid + 1;
+	ccqm_rmid_ptrs = kzalloc(sizeof(struct cqm_rmid_entry) *
+			   nr_rmids, GFP_KERNEL);
+	if (!ccqm_rmid_ptrs) {
+		ret = -ENOMEM;
+		goto fail;
+	}
+
+	for (; i <= cqm_max_rmid; i++) {
+		entry = &ccqm_rmid_ptrs[i];
+		INIT_LIST_HEAD(&entry->list);
+		entry->rmid = i;
+
+		list_add_tail(&entry->list, &pkg_data->cqm_rmid_free_lru);
+	}
+
+	pkg_data->cqm_rmid_ptrs = ccqm_rmid_ptrs;
+	cqm_pkgs_data[curr_pkgid] = pkg_data;
+
+	/*
+	 * RMID 0 is special and is always allocated. It's used for all
+	 * tasks that are not monitored.
+	 */
+	entry = __rmid_entry(0, curr_pkgid);
+	list_del(&entry->list);
+
+	return 0;
+fail:
+	kfree(ccqm_rmid_ptrs);
+	ccqm_rmid_ptrs = NULL;
+	kfree(pkg_data);
+	pkg_data = NULL;
+	cqm_pkgs_data[curr_pkgid] = NULL;
+	return ret;
+}
+
+static int cqm_init_pkgs_data(void)
+{
+	int i, cpu, ret = 0;
+
+	cqm_pkgs_data = kzalloc(
+		sizeof(struct pkg_data *) * cqm_socket_max,
+		GFP_KERNEL);
+	if (!cqm_pkgs_data)
+		return -ENOMEM;
+
+	for (i = 0; i < cqm_socket_max; i++)
+		cqm_pkgs_data[i] = NULL;
+
+	for_each_online_cpu(cpu) {
+		ret = pkg_data_init_cpu(cpu);
+		if (ret)
+			goto fail;
+	}
+
+	return 0;
+fail:
+	cqm_cleanup();
+	return ret;
+}
+
 static int intel_mbm_init(void)
 {
 	int ret = 0, array_size, maxid = cqm_max_rmid + 1;
 
-	mbm_socket_max = topology_max_packages();
-	array_size = sizeof(struct sample) * maxid * mbm_socket_max;
+	array_size = sizeof(struct sample) * maxid * cqm_socket_max;
 	mbm_local = kmalloc(array_size, GFP_KERNEL);
 	if (!mbm_local)
 		return -ENOMEM;
@@ -1052,7 +1086,7 @@ static int intel_mbm_init(void)
 		goto out;
 	}
 
-	array_size = sizeof(struct hrtimer) * mbm_socket_max;
+	array_size = sizeof(struct hrtimer) * cqm_socket_max;
 	mbm_timers = kmalloc(array_size, GFP_KERNEL);
 	if (!mbm_timers) {
 		ret = -ENOMEM;
@@ -1128,7 +1162,8 @@ static int __init intel_cqm_init(void)
 
 	event_attr_intel_cqm_llc_scale.event_str = str;
 
-	ret = intel_cqm_setup_rmid_cache();
+	cqm_socket_max = topology_max_packages();
+	ret = cqm_init_pkgs_data();
 	if (ret)
 		goto out;
 
@@ -1171,6 +1206,7 @@ out:
 	if (ret) {
 		kfree(str);
 		cqm_cleanup();
+		cqm_enabled = false;
 		mbm_cleanup();
 	}
 

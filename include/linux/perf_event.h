@@ -141,7 +141,7 @@ struct hw_perf_event {
 		};
 		struct { /* intel_cqm */
 			int			cqm_state;
-			u32			cqm_rmid;
+			u32			*cqm_rmid;
 			int			is_group_event;
 			struct list_head	cqm_events_entry;
 			struct list_head	cqm_groups_entry;
