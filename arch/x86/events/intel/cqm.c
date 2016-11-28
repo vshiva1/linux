@@ -85,6 +85,7 @@ static LIST_HEAD(cache_groups);
 static cpumask_t cqm_cpumask;
 
 struct pkg_data **cqm_pkgs_data;
+struct cgrp_cqm_info cqm_rootcginfo;
 
 #define RMID_VAL_ERROR		(1ULL << 63)
 #define RMID_VAL_UNAVAIL	(1ULL << 62)
@@ -193,6 +194,11 @@ static void __put_rmid(u32 rmid, int domain)
 	list_add_tail(&entry->list, &cqm_pkgs_data[domain]->cqm_rmid_limbo_lru);
 }
 
+static bool is_task_event(struct perf_event *e)
+{
+	return (e->attach_state & PERF_ATTACH_TASK);
+}
+
 static void cqm_cleanup(void)
 {
 	int i;
@@ -209,7 +215,6 @@ static void cqm_cleanup(void)
 	kfree(cqm_pkgs_data);
 }
 
-
 /*
  * Determine if @a and @b measure the same set of tasks.
  *
@@ -224,20 +229,18 @@ static bool __match_event(struct perf_event *a, struct perf_event *b)
 		return false;
 
 #ifdef CONFIG_CGROUP_PERF
-	if (a->cgrp != b->cgrp)
-		return false;
-#endif
-
-	/* If not task event, we're machine wide */
-	if (!(b->attach_state & PERF_ATTACH_TASK))
+	if ((is_cgroup_event(a) && is_cgroup_event(b)) &&
+		(a->cgrp == b->cgrp))
 		return true;
+#endif
 
 	/*
 	 * Events that target same task are placed into the same cache group.
 	 * Mark it as a multi event group, so that we update ->count
 	 * for every event rather than just the group leader later.
 	 */
-	if (a->hw.target == b->hw.target) {
+	if ((is_task_event(a) && is_task_event(b)) &&
+		(a->hw.target == b->hw.target)) {
 		b->hw.is_group_event = true;
 		return true;
 	}
@@ -365,6 +368,63 @@ static void init_mbm_sample(u32 *rmid, u32 evt_type)
 	on_each_cpu_mask(&cqm_cpumask, __intel_mbm_event_init, &rr, 1);
 }
 
+static inline void cqm_enable_mon(struct cgrp_cqm_info *cqm_info, u32 *rmid)
+{
+	if (rmid != NULL) {
+		cqm_info->mon_enabled = true;
+		cqm_info->rmid = rmid;
+	} else {
+		cqm_info->mon_enabled = false;
+		cqm_info->rmid = NULL;
+	}
+}
+
+static void cqm_assign_hier_rmid(struct cgroup_subsys_state *rcss, u32 *rmid)
+{
+	struct cgrp_cqm_info *ccqm_info, *rcqm_info;
+	struct cgroup_subsys_state *pos_css;
+
+	rcu_read_lock();
+
+	rcqm_info = css_to_cqm_info(rcss);
+
+	/* Enable or disable monitoring based on rmid.*/
+	cqm_enable_mon(rcqm_info, rmid);
+
+	pos_css = css_next_descendant_pre(rcss, rcss);
+	while (pos_css) {
+		ccqm_info = css_to_cqm_info(pos_css);
+
+		/*
+		 * Monitoring is being enabled.
+		 * Update the descendents to monitor for you, unless
+		 * they were already monitoring for a descendent of yours.
+		 */
+		if (rmid && (rcqm_info->level > ccqm_info->mfa->level))
+			ccqm_info->mfa = rcqm_info;
+
+		/*
+		 * Monitoring is being disabled.
+		 * Update the descendents who were monitoring for you
+		 * to monitor for the ancestor you were monitoring.
+		 */
+		if (!rmid && (ccqm_info->mfa == rcqm_info))
+			ccqm_info->mfa = rcqm_info->mfa;
+		pos_css = css_next_descendant_pre(pos_css, rcss);
+	}
+	rcu_read_unlock();
+}
+
+static int cqm_assign_rmid(struct perf_event *event, u32 *rmid)
+{
+#ifdef CONFIG_CGROUP_PERF
+	if (is_cgroup_event(event)) {
+		cqm_assign_hier_rmid(&event->cgrp->css, rmid);
+	}
+#endif
+	return 0;
+}
+
 /*
  * Find a group and setup RMID.
  *
@@ -402,11 +462,14 @@ static int intel_cqm_setup_event(struct perf_event *event,
 	return 0;
 }
 
+static u64 cqm_read_subtree(struct perf_event *event, struct rmid_read *rr);
+
 static void intel_cqm_event_read(struct perf_event *event)
 {
-	unsigned long flags;
-	u32 rmid;
-	u64 val;
+	struct rmid_read rr = {
+		.evt_type = event->attr.config,
+		.value = ATOMIC64_INIT(0),
+	};
 
 	/*
 	 * Task events are handled by intel_cqm_event_count().
@@ -414,26 +477,9 @@ static void intel_cqm_event_read(struct perf_event *event)
 	if (event->cpu == -1)
 		return;
 
-	raw_spin_lock_irqsave(&cache_lock, flags);
-	rmid = event->hw.cqm_rmid[pkg_id];
+	rr.rmid = ACCESS_ONCE(event->hw.cqm_rmid);
 
-	if (!__rmid_valid(rmid))
-		goto out;
-
-	if (is_mbm_event(event->attr.config))
-		val = rmid_read_mbm(rmid, event->attr.config);
-	else
-		val = __rmid_read(rmid);
-
-	/*
-	 * Ignore this reading on error states and do not update the value.
-	 */
-	if (val & (RMID_VAL_ERROR | RMID_VAL_UNAVAIL))
-		goto out;
-
-	local64_set(&event->count, val);
-out:
-	raw_spin_unlock_irqrestore(&cache_lock, flags);
+	cqm_read_subtree(event, &rr);
 }
 
 static void __intel_cqm_event_count(void *info)
@@ -545,6 +591,55 @@ static void mbm_hrtimer_init(void)
 	}
 }
 
+static void cqm_mask_call_local(struct rmid_read *rr)
+{
+	if (is_mbm_event(rr->evt_type))
+		__intel_mbm_event_count(rr);
+	else
+		__intel_cqm_event_count(rr);
+}
+
+static inline void
+	delta_local(struct perf_event *event, struct rmid_read *rr, u32 *rmid)
+{
+	atomic64_set(&rr->value, 0);
+	rr->rmid = ACCESS_ONCE(rmid);
+
+	cqm_mask_call_local(rr);
+	local64_add(atomic64_read(&rr->value), &event->count);
+}
+
+/*
+ * Since cgroup follows hierarchy, add the count of
+ *  the descendents who were being monitored as well.
+ */
+static u64 cqm_read_subtree(struct perf_event *event, struct rmid_read *rr)
+{
+#ifdef CONFIG_CGROUP_PERF
+
+	struct cgroup_subsys_state *rcss, *pos_css;
+	struct cgrp_cqm_info *ccqm_info;
+
+	cqm_mask_call_local(rr);
+	local64_set(&event->count, atomic64_read(&(rr->value)));
+
+	if (is_task_event(event))
+		return __perf_event_count(event);
+
+	rcu_read_lock();
+	rcss = &event->cgrp->css;
+	css_for_each_descendant_pre(pos_css, rcss) {
+		ccqm_info = (css_to_cqm_info(pos_css));
+
+		/* Add the descendent 'monitored cgroup' counts */
+		if (pos_css != rcss && ccqm_info->mon_enabled)
+			delta_local(event, rr, ccqm_info->rmid);
+	}
+	rcu_read_unlock();
+#endif
+	return __perf_event_count(event);
+}
+
 static u64 intel_cqm_event_count(struct perf_event *event)
 {
 	struct rmid_read rr = {
@@ -603,7 +698,7 @@ void alloc_needed_pkg_rmid(u32 *cqm_rmid)
 	if (WARN_ON(!cqm_rmid))
 		return;
 
-	if (cqm_rmid[pkg_id])
+	if (cqm_rmid == cqm_rootcginfo.rmid || cqm_rmid[pkg_id])
 		return;
 
 	raw_spin_lock_irqsave(&cache_lock, flags);
@@ -661,9 +756,11 @@ static inline void
 			__put_rmid(rmid[d], d);
 	}
 	kfree(event->hw.cqm_rmid);
+	cqm_assign_rmid(event, NULL);
 	list_del(&event->hw.cqm_groups_entry);
 }
-static void intel_cqm_event_destroy(struct perf_event *event)
+
+static void intel_cqm_event_terminate(struct perf_event *event)
 {
 	struct perf_event *group_other = NULL;
 	unsigned long flags;
@@ -917,6 +1014,7 @@ static struct pmu intel_cqm_pmu = {
 	.attr_groups	     = intel_cqm_attr_groups,
 	.task_ctx_nr	     = perf_sw_context,
 	.event_init	     = intel_cqm_event_init,
+	.event_terminate     = intel_cqm_event_terminate,
 	.add		     = intel_cqm_event_add,
 	.del		     = intel_cqm_event_stop,
 	.start		     = intel_cqm_event_start,
@@ -924,12 +1022,67 @@ static struct pmu intel_cqm_pmu = {
 	.read		     = intel_cqm_event_read,
 	.count		     = intel_cqm_event_count,
 };
+
 #ifdef CONFIG_CGROUP_PERF
 int perf_cgroup_arch_css_alloc(struct cgroup_subsys_state *parent_css,
 				      struct cgroup_subsys_state *new_css)
-{}
+{
+	struct cgrp_cqm_info *cqm_info, *pcqm_info;
+	struct perf_cgroup *new_cgrp;
+
+	if (!parent_css) {
+		cqm_rootcginfo.level = 0;
+
+		cqm_rootcginfo.mon_enabled = true;
+		cqm_rootcginfo.cont_mon = true;
+		cqm_rootcginfo.mfa = NULL;
+		INIT_LIST_HEAD(&cqm_rootcginfo.tskmon_rlist);
+
+		if (new_css) {
+			new_cgrp = css_to_perf_cgroup(new_css);
+			new_cgrp->arch_info = &cqm_rootcginfo;
+		}
+		return 0;
+	}
+
+	mutex_lock(&cache_mutex);
+
+	new_cgrp = css_to_perf_cgroup(new_css);
+
+	cqm_info = kzalloc(sizeof(struct cgrp_cqm_info), GFP_KERNEL);
+	if (!cqm_info) {
+		mutex_unlock(&cache_mutex);
+		return -ENOMEM;
+	}
+
+	pcqm_info = (css_to_cqm_info(parent_css));
+	cqm_info->level = pcqm_info->level + 1;
+	cqm_info->rmid = pcqm_info->rmid;
+
+	cqm_info->cont_mon = false;
+	cqm_info->mon_enabled = false;
+	INIT_LIST_HEAD(&cqm_info->tskmon_rlist);
+	if (!pcqm_info->mfa)
+		cqm_info->mfa = pcqm_info;
+	else
+		cqm_info->mfa = pcqm_info->mfa;
+
+	new_cgrp->arch_info = cqm_info;
+	mutex_unlock(&cache_mutex);
+
+	return 0;
+}
+
 void perf_cgroup_arch_css_free(struct cgroup_subsys_state *css)
-{}
+{
+	struct perf_cgroup *cgrp = css_to_perf_cgroup(css);
+
+	mutex_lock(&cache_mutex);
+	kfree(cgrp_to_cqm_info(cgrp));
+	cgrp->arch_info = NULL;
+	mutex_unlock(&cache_mutex);
+}
+
 void perf_cgroup_arch_attach(struct cgroup_taskset *tset)
 {}
 int perf_cgroup_arch_can_attach(struct cgroup_taskset *tset)
@@ -1052,6 +1205,12 @@ static int pkg_data_init_cpu(int cpu)
 	 */
 	entry = __rmid_entry(0, curr_pkgid);
 	list_del(&entry->list);
+
+	cqm_rootcginfo.rmid = kzalloc(sizeof(u32) * cqm_socket_max, GFP_KERNEL);
+	if (!cqm_rootcginfo.rmid) {
+		ret = -ENOMEM;
+		goto fail;
+	}
 
 	return 0;
 fail:
