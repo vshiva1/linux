@@ -363,6 +363,36 @@ static void init_mbm_sample(u32 *rmid, u32 evt_type)
 	on_each_cpu_mask(&cqm_cpumask, __intel_mbm_event_init, &rr, 1);
 }
 
+static inline int add_cgrp_tskmon_entry(u32 *rmid, struct list_head *l)
+{
+	struct tsk_rmid_entry *entry;
+
+	entry = kzalloc(sizeof(struct tsk_rmid_entry), GFP_KERNEL);
+	if (!entry)
+		return -ENOMEM;
+
+	INIT_LIST_HEAD(&entry->list);
+	entry->rmid = rmid;
+
+	list_add_tail(&entry->list, l);
+
+	return 0;
+}
+
+static inline void del_cgrp_tskmon_entry(u32 *rmid, struct list_head *l)
+{
+	struct tsk_rmid_entry *entry = NULL, *tmp1;
+
+	list_for_each_entry_safe(entry, tmp1, l, list) {
+		if (entry->rmid == rmid) {
+
+			list_del(&entry->list);
+			kfree(entry);
+			break;
+		}
+	}
+}
+
 #ifdef CONFIG_CGROUP_PERF
 struct cgrp_cqm_info *cqminfo_from_tsk(struct task_struct *tsk)
 {
@@ -379,6 +409,49 @@ struct cgrp_cqm_info *cqminfo_from_tsk(struct task_struct *tsk)
 	return ccinfo;
 }
 #endif
+
+static inline void
+	cgrp_tskmon_update(struct task_struct *tsk, u32 *rmid, bool ena)
+{
+	struct cgrp_cqm_info *ccinfo = NULL;
+
+#ifdef CONFIG_CGROUP_PERF
+	ccinfo = cqminfo_from_tsk(tsk);
+#endif
+	if (!ccinfo)
+		return;
+
+	if (ena)
+		add_cgrp_tskmon_entry(rmid, &ccinfo->tskmon_rlist);
+	else
+		del_cgrp_tskmon_entry(rmid, &ccinfo->tskmon_rlist);
+}
+
+static int cqm_assign_task_rmid(struct perf_event *event, u32 *rmid)
+{
+	struct task_struct *tsk;
+	int ret = 0;
+
+	rcu_read_lock();
+	tsk = event->hw.target;
+	if (pid_alive(tsk)) {
+		get_task_struct(tsk);
+
+		if (rmid != NULL)
+			cgrp_tskmon_update(tsk, rmid, true);
+		else
+			cgrp_tskmon_update(tsk, tsk->rmid, false);
+
+		tsk->rmid = rmid;
+
+		put_task_struct(tsk);
+	} else {
+		ret = -EINVAL;
+	}
+	rcu_read_unlock();
+
+	return ret;
+}
 
 static inline void cqm_enable_mon(struct cgrp_cqm_info *cqm_info, u32 *rmid)
 {
@@ -429,8 +502,12 @@ static void cqm_assign_hier_rmid(struct cgroup_subsys_state *rcss, u32 *rmid)
 
 static int cqm_assign_rmid(struct perf_event *event, u32 *rmid)
 {
+	if (is_task_event(event)) {
+		if (cqm_assign_task_rmid(event, rmid))
+			return -EINVAL;
+	}
 #ifdef CONFIG_CGROUP_PERF
-	if (is_cgroup_event(event)) {
+	else if (is_cgroup_event(event)) {
 		cqm_assign_hier_rmid(&event->cgrp->css, rmid);
 	}
 #endif
@@ -631,6 +708,8 @@ static u64 cqm_read_subtree(struct perf_event *event, struct rmid_read *rr)
 
 	struct cgroup_subsys_state *rcss, *pos_css;
 	struct cgrp_cqm_info *ccqm_info;
+	struct tsk_rmid_entry *entry;
+	struct list_head *l;
 
 	cqm_mask_call_local(rr);
 	local64_set(&event->count, atomic64_read(&(rr->value)));
@@ -646,6 +725,13 @@ static u64 cqm_read_subtree(struct perf_event *event, struct rmid_read *rr)
 		/* Add the descendent 'monitored cgroup' counts */
 		if (pos_css != rcss && ccqm_info->mon_enabled)
 			delta_local(event, rr, ccqm_info->rmid);
+
+		/* Add your and descendent 'monitored task' counts */
+		if (!list_empty(&ccqm_info->tskmon_rlist)) {
+			l = &ccqm_info->tskmon_rlist;
+			list_for_each_entry(entry, l, list)
+				delta_local(event, rr, entry->rmid);
+		}
 	}
 	rcu_read_unlock();
 #endif
@@ -1096,10 +1182,55 @@ void perf_cgroup_arch_css_free(struct cgroup_subsys_state *css)
 	mutex_unlock(&cache_mutex);
 }
 
+/*
+ * Called while attaching/detaching task to a cgroup.
+ */
+static bool is_task_monitored(struct task_struct *tsk)
+{
+	return (tsk->rmid != NULL);
+}
+
 void perf_cgroup_arch_attach(struct cgroup_taskset *tset)
-{}
+{
+	struct cgroup_subsys_state *new_css;
+	struct cgrp_cqm_info *cqm_info;
+	struct task_struct *task;
+
+	mutex_lock(&cache_mutex);
+
+	cgroup_taskset_for_each(task, new_css, tset) {
+		if (!is_task_monitored(task))
+			continue;
+
+		cqm_info = cqminfo_from_tsk(task);
+		if (cqm_info)
+			add_cgrp_tskmon_entry(task->rmid,
+					     &cqm_info->tskmon_rlist);
+	}
+	mutex_unlock(&cache_mutex);
+}
+
 int perf_cgroup_arch_can_attach(struct cgroup_taskset *tset)
-{}
+{
+	struct cgroup_subsys_state *new_css;
+	struct cgrp_cqm_info *cqm_info;
+	struct task_struct *task;
+
+	mutex_lock(&cache_mutex);
+	cgroup_taskset_for_each(task, new_css, tset) {
+		if (!is_task_monitored(task))
+			continue;
+		cqm_info = cqminfo_from_tsk(task);
+
+		if (cqm_info)
+			del_cgrp_tskmon_entry(task->rmid,
+					     &cqm_info->tskmon_rlist);
+
+	}
+	mutex_unlock(&cache_mutex);
+
+	return 0;
+}
 #endif
 
 static inline void cqm_pick_event_reader(int cpu)

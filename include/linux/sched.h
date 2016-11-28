@@ -1824,6 +1824,9 @@ struct task_struct {
 #ifdef CONFIG_INTEL_RDT_A
 	int closid;
 #endif
+#ifdef CONFIG_INTEL_RDT_M
+	u32 *rmid;
+#endif
 #ifdef CONFIG_FUTEX
 	struct robust_list_head __user *robust_list;
 #ifdef CONFIG_COMPAT
