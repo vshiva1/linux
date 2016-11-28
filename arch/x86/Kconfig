@@ -412,11 +412,28 @@ config GOLDFISH
        def_bool y
        depends on X86_GOLDFISH
 
+config INTEL_RDT
+	bool
+
+config INTEL_RDT_M
+	bool "Intel Resource Director Technology Monitoring support"
+	default n
+	depends on X86 && CPU_SUP_INTEL
+	select INTEL_RDT
+	help
+	  Select to enable resource monitoring which is a sub-feature of
+	  Intel Resource Director Technology(RDT). More information about
+	  RDT can be found in the Intel x86 Architecture Software
+	  Developer Manual.
+
+	  Say N if unsure.
+
 config INTEL_RDT_A
 	bool "Intel Resource Director Technology Allocation support"
 	default n
 	depends on X86 && CPU_SUP_INTEL
 	select KERNFS
+	select INTEL_RDT
 	help
 	  Select to enable resource allocation which is a sub-feature of
 	  Intel Resource Director Technology(RDT). More information about
