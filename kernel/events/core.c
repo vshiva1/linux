@@ -3443,8 +3443,12 @@ struct perf_read_data {
 
 static int find_cpu_to_read(struct perf_event *event, int local_cpu)
 {
+	bool active = event->state == PERF_EVENT_STATE_ACTIVE;
 	int event_cpu = event->oncpu;
 	u16 local_pkg, event_pkg;
+
+	if (__perf_can_read_inactive(event) && !active)
+		event_cpu = event->cpu;
 
 	if (event->group_caps & PERF_EV_CAP_READ_ACTIVE_PKG) {
 		event_pkg =  topology_physical_package_id(event_cpu);
@@ -3467,6 +3471,7 @@ static void __perf_event_read(void *info)
 	struct perf_event_context *ctx = event->ctx;
 	struct perf_cpu_context *cpuctx = __get_cpu_context(ctx);
 	struct pmu *pmu = event->pmu;
+	bool read_inactive = __perf_can_read_inactive(event);
 
 	/*
 	 * If this is a task context, we need to check whether it is
@@ -3475,7 +3480,7 @@ static void __perf_event_read(void *info)
 	 * event->count would have been updated to a recent sample
 	 * when the event was scheduled out.
 	 */
-	if (ctx->task && cpuctx->task_ctx != ctx)
+	if (ctx->task && cpuctx->task_ctx != ctx && !read_inactive)
 		return;
 
 	raw_spin_lock(&ctx->lock);
@@ -3485,7 +3490,7 @@ static void __perf_event_read(void *info)
 	}
 
 	update_event_times(event);
-	if (event->state != PERF_EVENT_STATE_ACTIVE)
+	if (ctx->task && cpuctx->task_ctx != ctx && !read_inactive)
 		goto unlock;
 
 	if (!data->group) {
@@ -3500,7 +3505,8 @@ static void __perf_event_read(void *info)
 
 	list_for_each_entry(sub, &event->sibling_list, group_entry) {
 		update_event_times(sub);
-		if (sub->state == PERF_EVENT_STATE_ACTIVE) {
+		if (sub->state == PERF_EVENT_STATE_ACTIVE ||
+		    __perf_can_read_inactive(sub)) {
 			/*
 			 * Use sibling's PMU rather than @event's since
 			 * sibling could be on different (eg: software) PMU.
@@ -3578,13 +3584,15 @@ u64 perf_event_read_local(struct perf_event *event)
 
 static int perf_event_read(struct perf_event *event, bool group)
 {
+	bool active = event->state == PERF_EVENT_STATE_ACTIVE;
 	int ret = 0, cpu_to_read, local_cpu;
 
 	/*
 	 * If event is enabled and currently active on a CPU, update the
 	 * value in the event structure:
 	 */
-	if (event->state == PERF_EVENT_STATE_ACTIVE) {
+	if (active || __perf_can_read_inactive(event)) {
+
 		struct perf_read_data data = {
 			.event = event,
 			.group = group,

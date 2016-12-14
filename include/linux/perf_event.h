@@ -525,10 +525,13 @@ typedef void (*perf_overflow_handler_t)(struct perf_event *,
  * PERF_EV_CAP_CGROUP_NO_RECURSION: A cgroup event that handles its own
  * cgroup scoping. It does not need to be enabled for all of its descendants
  * cgroups.
+ * PERF_EV_CAP_INACTIVE_CPU_READ_PKG: A cgroup event where we can read
+ * the package count on any cpu on the pkg even if inactive.
  */
-#define PERF_EV_CAP_SOFTWARE		BIT(0)
-#define PERF_EV_CAP_READ_ACTIVE_PKG	BIT(1)
-#define PERF_EV_CAP_CGROUP_NO_RECURSION	BIT(2)
+#define PERF_EV_CAP_SOFTWARE                    BIT(0)
+#define PERF_EV_CAP_READ_ACTIVE_PKG             BIT(1)
+#define PERF_EV_CAP_CGROUP_NO_RECURSION         BIT(2)
+#define PERF_EV_CAP_INACTIVE_CPU_READ_PKG       BIT(3)
 
 #define SWEVENT_HLIST_BITS		8
 #define SWEVENT_HLIST_SIZE		(1 << SWEVENT_HLIST_BITS)
@@ -721,6 +724,16 @@ struct perf_event {
 	struct list_head		sb_list;
 #endif /* CONFIG_PERF_EVENTS */
 };
+
+#ifdef CONFIG_PERF_EVENTS
+static inline bool __perf_can_read_inactive(struct perf_event *event)
+{
+	if ((event->group_caps & PERF_EV_CAP_INACTIVE_CPU_READ_PKG))
+		return true;
+
+	return false;
+}
+#endif
 
 /**
  * struct perf_event_context - event context structure

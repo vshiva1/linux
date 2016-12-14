@@ -111,6 +111,13 @@ bool __rmid_valid(u32 rmid)
 	return true;
 }
 
+static inline bool __rmid_valid_raw(u32 rmid)
+{
+	if (rmid > cqm_max_rmid)
+		return false;
+	return true;
+}
+
 static u64 __rmid_read(u32 rmid)
 {
 	u64 val;
@@ -884,16 +891,16 @@ out:
 	return __perf_event_count(event);
 }
 
-void alloc_needed_pkg_rmid(u32 *cqm_rmid)
+u32 alloc_needed_pkg_rmid(u32 *cqm_rmid)
 {
 	unsigned long flags;
 	u32 rmid;
 
 	if (WARN_ON(!cqm_rmid))
-		return;
+		return -EINVAL;
 
 	if (cqm_rmid == cqm_rootcginfo.rmid || cqm_rmid[pkg_id])
-		return;
+		return 0;
 
 	raw_spin_lock_irqsave(&cache_lock, flags);
 
@@ -902,6 +909,8 @@ void alloc_needed_pkg_rmid(u32 *cqm_rmid)
 		cqm_rmid[pkg_id] = rmid;
 
 	raw_spin_unlock_irqrestore(&cache_lock, flags);
+
+	return rmid;
 }
 
 static void intel_cqm_event_start(struct perf_event *event, int mode)
@@ -913,10 +922,8 @@ static void intel_cqm_event_start(struct perf_event *event, int mode)
 
 	event->hw.cqm_state &= ~PERF_HES_STOPPED;
 
-	if (is_task_event(event)) {
-		alloc_needed_pkg_rmid(event->hw.cqm_rmid);
+	if (is_task_event(event))
 		state->next_task_rmid = event->hw.cqm_rmid[pkg_id];
-	}
 }
 
 static void intel_cqm_event_stop(struct perf_event *event, int mode)
@@ -932,10 +939,19 @@ static void intel_cqm_event_stop(struct perf_event *event, int mode)
 
 static int intel_cqm_event_add(struct perf_event *event, int mode)
 {
+	u32 rmid;
+
 	event->hw.cqm_state = PERF_HES_STOPPED;
 
-	if ((mode & PERF_EF_START))
+	/*
+	 * If Lazy RMID alloc fails indicate the error to the user.
+	*/
+	if ((mode & PERF_EF_START)) {
+		rmid = alloc_needed_pkg_rmid(event->hw.cqm_rmid);
+		if (!__rmid_valid_raw(rmid))
+			return -EINVAL;
 		intel_cqm_event_start(event, mode);
+	}
 
 	return 0;
 }
@@ -1048,6 +1064,7 @@ static int intel_cqm_event_init(struct perf_event *event)
 	 * cgroup hierarchies.
 	 */
 	event->event_caps |= PERF_EV_CAP_CGROUP_NO_RECURSION;
+	event->event_caps |= PERF_EV_CAP_INACTIVE_CPU_READ_PKG;
 
 	mutex_lock(&cache_mutex);
 
