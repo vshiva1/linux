@@ -91,6 +91,9 @@ void __intel_rdt_sched_in(void)
 
 	if (closid != state->closid || rmid != state->rmid) {
 
+		pr_info("sched in cpu:%d,rmidnew:%d,old:%d \n",
+				smp_processor_id(),rmid, state->rmid);
+
 		state->closid = closid;
 		state->rmid = rmid;
 		wrmsr(MSR_IA32_PQR_ASSOC, rmid, closid);

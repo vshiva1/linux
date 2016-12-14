@@ -201,6 +201,7 @@ static void __put_rmid(u32 rmid, int domain)
 	entry->state = RMID_DIRTY;
 
 	list_add_tail(&entry->list, &cqm_pkgs_data[domain]->cqm_rmid_limbo_lru);
+	pr_info("limboed rmid %d, pkg: %d\n",rmid, domain);
 }
 
 static bool is_task_event(struct perf_event *e)
@@ -336,6 +337,8 @@ static void __intel_cqm_rmid_reuse(void)
 	llist = &pdata->cqm_rmid_limbo_lru;
 	flist = &pdata->cqm_rmid_free_lru;
 
+	pr_info("reuse work 1,pkg%d\n",pkg_id);
+
 	if (list_empty(llist))
 		goto end;
 	/*
@@ -352,6 +355,7 @@ static void __intel_cqm_rmid_reuse(void)
 		 */
 		list_del(&entry->list);
 		list_add_tail(&entry->list, flist);
+		pr_info("moved from limbo to free : %d,pkg%d\n",entry->rmid,pkg_id);
 	}
 
 end:
@@ -477,6 +481,8 @@ static inline int add_cgrp_tskmon_entry(u32 *rmid, struct list_head *l)
 
 	list_add_tail(&entry->list, l);
 
+	pr_info("added task to taskmon list \n");
+
 	return 0;
 }
 
@@ -484,8 +490,10 @@ static inline void del_cgrp_tskmon_entry(u32 *rmid, struct list_head *l)
 {
 	struct tsk_rmid_entry *entry = NULL, *tmp1;
 
+	pr_info("try delete task from taskmon list \n");
 	list_for_each_entry_safe(entry, tmp1, l, list) {
 		if (entry->rmid == rmid) {
+			pr_info("deleted really task from taskmon list \n");
 
 			list_del(&entry->list);
 			kfree(entry);
@@ -526,6 +534,8 @@ static inline void
 		add_cgrp_tskmon_entry(rmid, &ccinfo->tskmon_rlist);
 	else
 		del_cgrp_tskmon_entry(rmid, &ccinfo->tskmon_rlist);
+
+	pr_info("taskmon list used from : %p\n", ccinfo);
 }
 
 static int cqm_assign_task_rmid(struct perf_event *event, u32 *rmid)
@@ -545,6 +555,8 @@ static int cqm_assign_task_rmid(struct perf_event *event, u32 *rmid)
 
 		tsk->rmid = rmid;
 
+		pr_info("task: %d got the rmid:empty\n", tsk->pid);
+
 		put_task_struct(tsk);
 	} else {
 		ret = -EINVAL;
@@ -563,6 +575,7 @@ static inline void cqm_enable_mon(struct cgrp_cqm_info *cqm_info, u32 *rmid)
 		cqm_info->mon_enabled = false;
 		cqm_info->rmid = NULL;
 	}
+	pr_info("cgroup got the rmid:%p\n",rmid);
 }
 
 static void cqm_assign_hier_rmid(struct cgroup_subsys_state *rcss, u32 *rmid)
@@ -633,6 +646,7 @@ static int intel_cqm_setup_event(struct perf_event *event,
 		if (__match_event(iter, event)) {
 			/* All tasks in a group share an RMID */
 			event->hw.cqm_rmid = rmid;
+			pr_info("reusing rmid:%p\n",rmid);
 			*group = iter;
 			if (is_mbm_event(event->attr.config))
 				init_mbm_sample(rmid, event->attr.config);
@@ -663,6 +677,9 @@ static void intel_cqm_event_read(struct perf_event *event)
 		.value = ATOMIC64_INIT(0),
 	};
 
+	pr_info("cqm read called rmid: %d,cpu:%d\n",
+		event->hw.cqm_rmid[pkg_id], smp_processor_id());
+
 	/*
 	 * Task events are handled by intel_cqm_event_count().
 	 */
@@ -671,6 +688,8 @@ static void intel_cqm_event_read(struct perf_event *event)
 
 	rr.rmid = ACCESS_ONCE(event->hw.cqm_rmid);
 
+	pr_info("cqm read really called, cpu : %d,rmid:%d\n",
+		smp_processor_id(), event->hw.cqm_rmid[pkg_id]);
 	cqm_read_subtree(event, &rr);
 }
 
@@ -814,6 +833,8 @@ static u64 cqm_read_subtree(struct perf_event *event, struct rmid_read *rr)
 	struct tsk_rmid_entry *entry;
 	struct list_head *l;
 
+	pr_info("count cgroup start \n");
+
 	cqm_mask_call_local(rr);
 	local64_set(&event->count, atomic64_read(&(rr->value)));
 
@@ -834,10 +855,16 @@ static u64 cqm_read_subtree(struct perf_event *event, struct rmid_read *rr)
 			l = &ccqm_info->tskmon_rlist;
 			list_for_each_entry(entry, l, list)
 				delta_local(event, rr, entry->rmid);
-		}
+
+			pr_info("found taskmon in cgroup rmid:\n");
+		} else
+			pr_info("NOfound taskmon in cgroup rmid\n");
 	}
 	rcu_read_unlock();
 #endif
+	pr_info("count cgroup done , count:%lu\n", local64_read(&event->count) * cqm_l3_scale);
+
+
 	return __perf_event_count(event);
 }
 
@@ -887,6 +914,10 @@ static u64 intel_cqm_event_count(struct perf_event *event)
 	cqm_mask_call(&rr);
 	local64_set(&event->count, atomic64_read(&rr.value));
 
+
+	pr_info("cqm count really called, rmid:%d count:%lu\n",event->hw.cqm_rmid[pkg_id],
+		 local64_read(&event->count) * cqm_l3_scale);
+
 out:
 	return __perf_event_count(event);
 }
@@ -910,6 +941,10 @@ u32 alloc_needed_pkg_rmid(u32 *cqm_rmid)
 
 	raw_spin_unlock_irqrestore(&cache_lock, flags);
 
+
+	pr_info("sched_in_alloc assigned evt rmid:%d,pkg:%d\n",
+		cqm_rmid[pkg_id],pkg_id);
+
 	return rmid;
 }
 
@@ -921,6 +956,10 @@ static void intel_cqm_event_start(struct perf_event *event, int mode)
 		return;
 
 	event->hw.cqm_state &= ~PERF_HES_STOPPED;
+
+	pr_info("cqm start event, pkgid:%d, cpu:%d, pid:%d, \n",
+		pkg_id, smp_processor_id(), current->pid);
+
 
 	if (is_task_event(event))
 		state->next_task_rmid = event->hw.cqm_rmid[pkg_id];
@@ -977,6 +1016,8 @@ static void intel_cqm_event_terminate(struct perf_event *event)
 	unsigned long flags;
 	int d;
 
+	pr_info("event terminate start\n");
+
 	mutex_lock(&cache_mutex);
 	/*
 	* Hold the cache_lock as mbm timer handlers could be
@@ -1023,8 +1064,11 @@ static void intel_cqm_event_terminate(struct perf_event *event)
 
 		if (cqm_pkgs_data[d] != NULL && is_first_cqmwork(d)) {
 			cqm_schedule_rmidwork(d);
+			pr_info("cqm work scheduled\n");
 		}
 	}
+
+	pr_info("event terminate end\n");
 }
 
 static int intel_cqm_event_init(struct perf_event *event)
@@ -1096,6 +1140,9 @@ static int intel_cqm_event_init(struct perf_event *event)
 	raw_spin_unlock_irqrestore(&cache_lock, flags);
 out:
 	mutex_unlock(&cache_mutex);
+
+	pr_info("event init done\n");
+
 
 	return ret;
 }
@@ -1288,6 +1335,8 @@ int perf_cgroup_arch_css_alloc(struct cgroup_subsys_state *parent_css,
 		cqm_info->mfa = pcqm_info->mfa;
 
 	new_cgrp->arch_info = cqm_info;
+
+	pr_info("cgroup created with cqm_info:%p\n",cqm_info);
 	mutex_unlock(&cache_mutex);
 
 	return 0;
@@ -1319,6 +1368,8 @@ void perf_cgroup_arch_attach(struct cgroup_taskset *tset)
 
 	mutex_lock(&cache_mutex);
 
+	pr_info("cgroup task attached mon try\n");
+
 	cgroup_taskset_for_each(task, new_css, tset) {
 		if (!is_task_monitored(task))
 			continue;
@@ -1327,6 +1378,9 @@ void perf_cgroup_arch_attach(struct cgroup_taskset *tset)
 		if (cqm_info)
 			add_cgrp_tskmon_entry(task->rmid,
 					     &cqm_info->tskmon_rlist);
+
+	pr_info("cgroup task attached try1 mon from:%p,pid:%d,mon:%d\n",
+		cqm_info,task->pid, (task->rmid != NULL));
 	}
 	mutex_unlock(&cache_mutex);
 }
@@ -1338,6 +1392,9 @@ int perf_cgroup_arch_can_attach(struct cgroup_taskset *tset)
 	struct task_struct *task;
 
 	mutex_lock(&cache_mutex);
+
+	pr_info("cgroup task detached mon try\n");
+
 	cgroup_taskset_for_each(task, new_css, tset) {
 		if (!is_task_monitored(task))
 			continue;
@@ -1347,6 +1404,8 @@ int perf_cgroup_arch_can_attach(struct cgroup_taskset *tset)
 			del_cgrp_tskmon_entry(task->rmid,
 					     &cqm_info->tskmon_rlist);
 
+		pr_info("cgroup task dettached try1 mon from:%p,pid:%d,mon:%d\n",
+			cqm_info,task->pid, (task->rmid != NULL));
 	}
 	mutex_unlock(&cache_mutex);
 
@@ -1431,6 +1490,8 @@ static int pkg_data_init_cpu(int cpu)
 
 	if (cqm_pkgs_data[curr_pkgid])
 		return 0;
+
+	pr_info("pkg data init for cpu:%d\n",cpu);
 
 	pkg_data = kzalloc_node(sizeof(struct pkg_data),
 				GFP_KERNEL, cpu_to_node(cpu));
