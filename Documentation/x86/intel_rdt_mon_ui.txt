@@ -1,0 +1,62 @@
+User Interface for Resource Monitoring in Intel Resource Director Technology
+
+Vikas Shivappa<vikas.shivappa@intel.com>
+David Carrillo-Cisneros<davidcc@google.com>
+Stephane Eranian <eranian@google.com>
+
+This feature is enabled by the CONFIG_INTEL_RDT_M Kconfig and the
+X86 /proc/cpuinfo flag bits cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local
+
+Resource Monitoring
+-------------------
+Resource Monitoring includes cqm(cache quality monitoring) and
+mbm(memory bandwidth monitoring) and uses the perf interface. A light
+weight interface to enable monitoring without perf is enabled as well.
+
+CQM provides OS/VMM a way to monitor llc occupancy. It measures the
+amount of L3 cache fills per task or cgroup.
+
+MBM provides OS/VMM a way to monitor bandwidth from one level of cache
+to another. The current patches support L3 external bandwidth
+monitoring. It supports both 'local bandwidth' and 'total bandwidth'
+monitoring for the socket. Local bandwidth measures the amount of data
+sent through the memory controller on the socket and total b/w measures
+the total system bandwidth.
+
+To check the monitoring events enabled:
+
+$ ./tools/perf/perf list | grep -i cqm
+intel_cqm/llc_occupancy/                           [Kernel PMU event]
+intel_cqm/local_bytes/                             [Kernel PMU event]
+intel_cqm/total_bytes/                             [Kernel PMU event]
+
+Monitoring tasks and cgroups using perf
+---------------------------------------
+Monitoring tasks and cgroup is like using any other perf event.
+
+$perf stat -I 1000 -e intel_cqm_llc/local_bytes/ -p PID1
+
+This will monitor the local_bytes event of the PID1 and report once
+every 1000ms
+
+$mkdir /sys/fs/cgroup/perf_event/p1
+$echo PID1 > /sys/fs/cgroup/perf_event/p1/tasks
+$echo PID2 > /sys/fs/cgroup/perf_event/p1/tasks
+
+$perf stat -I 1000 -e intel_cqm_llc/llc_occupancy/ -a -G p1
+
+This will monitor the llc_occupancy event of the perf cgroup p1 in
+interval mode.
+
+Hierarchical monitoring should work just like other events and users can
+also monitor a task with in a cgroup and the cgroup together, or
+different cgroups in the same hierarchy can be monitored together.
+
+The events are associated with RMIDs and are grouped when optimal. The
+RMIDs are limited hardware resources and if runout the events would just
+throw error on read.
+
+To obtain per package data for cgroups(package x) provide any cpu in the
+package as input to -C:
+
+$perf stat -I 1000 -e intel_cqm_llc/llc_occupancy/ -C <cpu_y on package_x> -G p1
